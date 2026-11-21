@@ -18,6 +18,7 @@ usa il proprio supporto per mouse Bluetooth, senza un'applicazione dedicata.
 - [Compilazione e caricamento](#it-installazione)
 - [Avvio e associazione Bluetooth](#it-avvio)
 - [Regolazioni](#it-regolazioni)
+- [Calibrazione e regolazione dal PC](#it-calibrazione)
 - [Struttura del progetto e programmi sperimentali](#it-struttura)
 - [Risoluzione dei problemi](#it-problemi)
 - [Licenza](#it-licenza)
@@ -35,6 +36,8 @@ usa il proprio supporto per mouse Bluetooth, senza un'applicazione dedicata.
   ogni 20 ms quando il computer ha abilitato le notifiche HID.
 - All'avvio il giroscopio viene calibrato. Se il sensore non è disponibile o la
   calibrazione fallisce, i pulsanti continuano a funzionare.
+- Sensibilità, zona morta, accelerazione del cursore e orientamento del sensore
+  si regolano dal computer attraverso la porta seriale, senza ricompilare.
 
 La versione attuale non implementa la rotella o il clic centrale. Il livello batteria
 Bluetooth è impostato al 100% come segnaposto: non è una misura reale.
@@ -158,13 +161,56 @@ Le costanti si trovano all'inizio di [main.cpp](firmware/src/main.cpp).
 | `LEFT_PIN` / `RIGHT_PIN` | `15` / `16` | GPIO dei contatti sinistro e destro |
 | `SDA_PIN` / `SCL_PIN` | `8` / `9` | GPIO del bus I²C |
 | `MPU_ADDR` | `0x68` | Indirizzo del sensore con AD0 a GND |
-| `SENSITIVITY` | `0.2f` | Aumentandola, il cursore si muove più velocemente |
-| `DEADZONE` | `1.0f` | Soglia in gradi/s sotto cui il movimento viene ignorato |
 | `DEBOUNCE_MS` | `20` | Tempo di antirimbalzo dei contatti |
 | `SEND_MS` | `20` | Intervallo tra i report mouse, in millisecondi |
 
-Per invertire un verso di movimento modifica il segno nelle espressioni di `vx`
-o `vy` nel `loop()`. Dopo ogni modifica ricompila e ricarica il firmware.
+Dopo ogni modifica ricompila e ricarica il firmware. Sensibilità, zona morta,
+accelerazione e versi di movimento non sono costanti: si cambiano dal computer,
+come descritto nella sezione seguente.
+
+<a id="it-calibrazione"></a>
+### Calibrazione e regolazione dal PC
+
+[tools/eous_tune.py](tools/eous_tune.py) comunica con il firmware attraverso la
+porta seriale USB. Richiede Python 3 e `pyserial`; il monitor seriale deve essere
+chiuso, perché la porta va usata da un solo programma alla volta.
+
+```bash
+pip install pyserial
+python tools/eous_tune.py
+```
+
+| Comando | Effetto |
+| --- | --- |
+| `mostra` | Elenca i parametri attuali |
+| `set NOME VALORE` | Cambia un parametro, subito attivo |
+| `salva` / `reset` | Conserva i parametri nella memoria del dispositivo / ripristina quelli iniziali |
+| `curva` | Mostra la velocità del cursore per ogni velocità della mano |
+| `bias` | Misura offset e rumore del giroscopio a sensore fermo |
+| `assi` | Impara da due movimenti quale rotazione significa destra e quale su |
+| `drift` | Registra un movimento con ritorno al punto di partenza e indica da dove nasce l'eventuale deriva |
+| `live` / `registra FILE` | Mostra i dati del sensore in tempo reale / li salva in CSV |
+
+| Parametro | Valore iniziale | Effetto |
+| --- | --- | --- |
+| `sens` | `10` | Pixel per grado di rotazione |
+| `deadzone` | `1` | Velocità in gradi/s sotto cui il cursore resta fermo |
+| `acc_lo` / `acc_hi` | `50` / `400` | Velocità della mano, in gradi/s, tra cui l'accelerazione cresce |
+| `acc_max` | `1` | Moltiplicatore massimo dell'accelerazione; `1` la disattiva |
+| `x_gx` … `y_gz` | X = −gz, Y = −gx | Contributo di ogni asse del giroscopio al movimento del cursore |
+
+[tools/eous_gui.py](tools/eous_gui.py) offre le stesse regolazioni in una pagina
+del browser, con un cursore virtuale che mostra il movimento inviato dal firmware:
+
+```bash
+python tools/eous_gui.py
+```
+
+La pagina è servita solo su `127.0.0.1` e non richiede connessione a Internet.
+Console e interfaccia grafica non possono usare la porta seriale insieme.
+
+Il protocollo è testuale, una riga per comando: `get`, `set nome valore`,
+`stream 0|1`, `save`, `reset`. Si può quindi provare anche dal monitor seriale.
 
 <a id="it-struttura"></a>
 ### Struttura del progetto e programmi sperimentali
@@ -173,6 +219,8 @@ o `vy` nel `loop()`. Dopo ogni modifica ricompila e ricarica il firmware.
 | --- | --- |
 | [firmware/platformio.ini](firmware/platformio.ini) | Scheda, ambiente di compilazione e dipendenze |
 | [firmware/src/main.cpp](firmware/src/main.cpp) | Firmware attivo: mouse BLE, MPU6050 e due contatti |
+| [tools/eous_tune.py](tools/eous_tune.py) | Calibrazione e regolazione dal PC attraverso la seriale USB |
+| [tools/eous_gui.py](tools/eous_gui.py), [tools/eous_gui.html](tools/eous_gui.html) | Interfaccia grafica nel browser: cursore virtuale e regolazioni |
 | [firmware/src/touch_test_2.cpp](firmware/src/touch_test_2.cpp) | Esperimento: contatti verso GND oppure scansione dei collegamenti tra GPIO15–18; attualmente `MODE 2` |
 | [firmware/test/touch_test_1.cpp](firmware/test/touch_test_1.cpp) | Esperimento: touch capacitivo su GPIO4 e contatto verso GND su GPIO15 |
 | [firmware/test/mpu_test_1.cpp](firmware/test/mpu_test_1.cpp) | Esperimento: scansione I²C e lettura di accelerometro, giroscopio e temperatura |
@@ -191,7 +239,7 @@ verso GND del firmware principale.
 | Problema | Controlli |
 | --- | --- |
 | Sensore non disponibile o calibrazione fallita | Controlla alimentazione, massa comune, SDA su GPIO8, SCL su GPIO9 e AD0 a GND, poi riavvia. I clic restano disponibili. |
-| Cursore che si muove a riposo | Riavvia tenendo fermo il sensore; se necessario regola `DEADZONE`. |
+| Cursore che si muove a riposo | Riavvia tenendo fermo il sensore; se necessario esegui `bias` o aumenta `deadzone` con `eous_tune.py`. |
 | Clic non rilevati | Verifica che ogni contatto chiuda il GPIO corretto verso GND e che il mouse sia connesso. |
 | Mouse non visibile o associazione non riuscita | Controlla alimentazione e messaggi seriali; se esiste una vecchia associazione, rimuovila dal computer e ripeti l'associazione. |
 | Nessun messaggio seriale | Controlla cavo USB dati, porta selezionata e velocità di 115200 baud; riavvia con il monitor aperto per leggere i messaggi iniziali. |
@@ -221,6 +269,7 @@ mouse support, without a dedicated application.
 - [Building and uploading](#en-installation)
 - [Startup and Bluetooth pairing](#en-startup)
 - [Adjustments](#en-adjustments)
+- [Calibration and tuning from the PC](#en-calibration)
 - [Project structure and experimental programs](#en-structure)
 - [Troubleshooting](#en-troubleshooting)
 - [License](#en-license)
@@ -238,6 +287,8 @@ mouse support, without a dedicated application.
   20 ms when the computer has enabled HID notifications.
 - The gyroscope is calibrated at startup. If the sensor is unavailable or
   calibration fails, the buttons keep working.
+- Sensitivity, deadzone, pointer acceleration and sensor orientation are tuned
+  from the computer over the serial port, without rebuilding.
 
 The current version does not implement scrolling or a middle click. The Bluetooth
 battery level is set to 100% as a placeholder; it is not a real measurement.
@@ -360,13 +411,57 @@ The constants are at the beginning of [main.cpp](firmware/src/main.cpp).
 | `LEFT_PIN` / `RIGHT_PIN` | `15` / `16` | GPIO pins for the left and right contacts |
 | `SDA_PIN` / `SCL_PIN` | `8` / `9` | I²C bus GPIO pins |
 | `MPU_ADDR` | `0x68` | Sensor address with AD0 connected to GND |
-| `SENSITIVITY` | `0.2f` | Increase it for faster pointer movement |
-| `DEADZONE` | `1.0f` | Threshold in degrees/s below which movement is ignored |
 | `DEBOUNCE_MS` | `20` | Contact debounce time |
 | `SEND_MS` | `20` | Interval between mouse reports, in milliseconds |
 
-To reverse a movement direction, change the sign in the `vx` or `vy` expressions
-inside `loop()`. Rebuild and upload the firmware after each change.
+Rebuild and upload the firmware after each change. Sensitivity, deadzone,
+acceleration and movement directions are not constants: they are changed from
+the computer, as described in the next section.
+
+<a id="en-calibration"></a>
+### Calibration and tuning from the PC
+
+[tools/eous_tune.py](tools/eous_tune.py) talks to the firmware over the USB
+serial port. It requires Python 3 and `pyserial`; close the serial monitor first,
+because only one program at a time should use the port. The tool's commands and
+messages are currently in Italian.
+
+```bash
+pip install pyserial
+python tools/eous_tune.py
+```
+
+| Command | Effect |
+| --- | --- |
+| `mostra` | Lists the current parameters |
+| `set NAME VALUE` | Changes a parameter, effective immediately |
+| `salva` / `reset` | Stores the parameters in the device's memory / restores the initial ones |
+| `curva` | Shows the pointer speed for each hand speed |
+| `bias` | Measures gyroscope offset and noise while the sensor is still |
+| `assi` | Learns from two movements which rotation means right and which means up |
+| `drift` | Records a movement that returns to its starting point and reports where any drift comes from |
+| `live` / `registra FILE` | Shows the sensor data in real time / saves it as CSV |
+
+| Parameter | Initial value | Effect |
+| --- | --- | --- |
+| `sens` | `10` | Pixels per degree of rotation |
+| `deadzone` | `1` | Speed in degrees/s below which the pointer stays still |
+| `acc_lo` / `acc_hi` | `50` / `400` | Hand speeds, in degrees/s, between which acceleration ramps up |
+| `acc_max` | `1` | Maximum acceleration multiplier; `1` turns it off |
+| `x_gx` … `y_gz` | X = −gz, Y = −gx | Contribution of each gyroscope axis to pointer movement |
+
+[tools/eous_gui.py](tools/eous_gui.py) offers the same adjustments in a browser
+page, with a virtual pointer that shows the movement sent by the firmware:
+
+```bash
+python tools/eous_gui.py
+```
+
+The page is served on `127.0.0.1` only and needs no Internet connection. The
+console and the graphical interface cannot use the serial port at the same time.
+
+The protocol is plain text, one command per line: `get`, `set name value`,
+`stream 0|1`, `save`, `reset`. It can therefore be tried from the serial monitor too.
 
 <a id="en-structure"></a>
 ### Project structure and experimental programs
@@ -375,6 +470,8 @@ inside `loop()`. Rebuild and upload the firmware after each change.
 | --- | --- |
 | [firmware/platformio.ini](firmware/platformio.ini) | Board, build environment and dependencies |
 | [firmware/src/main.cpp](firmware/src/main.cpp) | Active firmware: BLE mouse, MPU6050 and two contacts |
+| [tools/eous_tune.py](tools/eous_tune.py) | Calibration and tuning from the PC over USB serial |
+| [tools/eous_gui.py](tools/eous_gui.py), [tools/eous_gui.html](tools/eous_gui.html) | Graphical interface in the browser: virtual pointer and adjustments |
 | [firmware/src/touch_test_2.cpp](firmware/src/touch_test_2.cpp) | Experiment: contacts to GND or connection scanning between GPIO15–18; currently `MODE 2` |
 | [firmware/test/touch_test_1.cpp](firmware/test/touch_test_1.cpp) | Experiment: capacitive touch on GPIO4 and a contact to GND on GPIO15 |
 | [firmware/test/mpu_test_1.cpp](firmware/test/mpu_test_1.cpp) | Experiment: I²C scan and accelerometer, gyroscope and temperature readings |
@@ -393,7 +490,7 @@ firmware's contacts to GND.
 | Problem | Checks |
 | --- | --- |
 | Sensor unavailable or calibration failed | Check power, common ground, SDA on GPIO8, SCL on GPIO9 and AD0 to GND, then restart. Clicks remain available. |
-| Pointer moves while the sensor is still | Restart while keeping the sensor still; adjust `DEADZONE` if needed. |
+| Pointer moves while the sensor is still | Restart while keeping the sensor still; if needed run `bias` or raise `deadzone` with `eous_tune.py`. |
 | Clicks are not detected | Check that each contact closes the correct GPIO to GND and that the mouse is connected. |
 | Mouse is not visible or pairing fails | Check power and serial messages; if an old pairing exists, remove it from the computer and pair again. |
 | No serial messages | Check the USB data cable, selected port and 115200 baud rate; restart with the monitor open to read startup messages. |

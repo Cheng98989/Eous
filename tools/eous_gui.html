@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eous</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2026; --line: #2f343d; --text: #e6e8ec; --muted: #9299a6;
+    --accent: #4da3ff; --ideal: #f0a13a; --error: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 16px; max-width: 1500px; margin: auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  h2 { font-size: 12px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+  canvas { display: block; width: 100%; }
+  #screen { border: 1px solid var(--line); border-radius: 6px; background: #0d0f12; }
+  #status { color: var(--muted); min-height: 1.4em; margin: 0 0 12px; }
+  #status.error { color: var(--error); }
+  .readouts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 12px; }
+  .readouts div { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  .readouts span { display: block; color: var(--muted); font-size: 12px; }
+  .readouts b { font: 600 15px ui-monospace, monospace; white-space: pre; }
+  label.slider { display: block; margin-bottom: 12px; }
+  label.slider .row { display: flex; justify-content: space-between; }
+  label.slider output { font: 13px ui-monospace, monospace; color: var(--accent); }
+  input[type=range] { width: 100%; margin: 4px 0 0; accent-color: var(--accent); }
+  button { width: 100%; padding: 8px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 6px;
+           background: #272b33; color: var(--text); font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+  .legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 6px; background: var(--accent); }
+  .legend label { cursor: pointer; }
+  .legend label i { background: var(--ideal); }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <h1>Eous: cursore virtuale</h1>
+    <p id="status">Collegamento in corso...</p>
+    <canvas id="screen"></canvas>
+    <div class="legend">
+      <span><i></i>movimento inviato dal firmware</span>
+      <label><input type="checkbox" id="showIdeal" checked> <i></i>solo sensibilità, senza accelerazione e zona morta</label>
+      <span id="scale"></span>
+    </div>
+    <div class="readouts">
+      <div><span>Giroscopio X Y Z (°/s)</span><b id="gyro">-</b></div>
+      <div><span>Velocità della mano (°/s)</span><b id="speed">-</b></div>
+      <div><span>Velocità del cursore (px/s)</span><b id="cursorSpeed">-</b></div>
+      <div><span>Distanza dal centro (px)</span><b id="offset">-</b></div>
+    </div>
+    <p class="hint">Il riquadro rappresenta il tuo schermo. Il cursore disegnato segue i movimenti che il firmware
+      invia via Bluetooth, prima che il sistema operativo applichi la propria accelerazione: se qui torna al centro
+      e il cursore vero no, la differenza nasce nel computer e non nel dispositivo.</p>
+  </div>
+
+  <div>
+    <section>
+      <h2>Regolazioni</h2>
+      <div id="sliders"></div>
+      <canvas id="curve" height="150"></canvas>
+      <p class="hint">Curva: velocità del cursore (px/s) in funzione della velocità della mano (°/s).
+        Il punto è la velocità di adesso.</p>
+    </section>
+    <section>
+      <h2>Azioni</h2>
+      <button id="center">Centra il cursore (tasto C)</button>
+      <button id="bias">Calibra l'offset del giroscopio</button>
+      <button id="save">Salva nel dispositivo</button>
+      <button id="reset">Ripristina i valori iniziali</button>
+      <p class="hint">Le regolazioni valgono subito; senza «Salva» si perdono allo spegnimento.</p>
+    </section>
+  </div>
+</main>
+
+<script>
+const CONTROLS = [
+  { name: "sens", label: "Sensibilità", unit: "px/°", min: 1, max: 40, step: 0.5 },
+  { name: "deadzone", label: "Zona morta", unit: "°/s", min: 0, max: 5, step: 0.1 },
+  { name: "acc_max", label: "Accelerazione massima", unit: "×", min: 1, max: 6, step: 0.1 },
+  { name: "acc_lo", label: "Accelerazione: da", unit: "°/s", min: 0, max: 300, step: 5 },
+  { name: "acc_hi", label: "Accelerazione: fino a", unit: "°/s", min: 50, max: 1000, step: 10 },
+];
+const TRAIL_SECONDS = 8;
+const COLORS = { sent: "#4da3ff", ideal: "#f0a13a", grid: "#2f343d", text: "#9299a6" };
+const $ = id => document.getElementById(id);
+
+// Lo schermo virtuale ha le dimensioni di quello vero, in pixel.
+const display = { w: window.screen.width, h: window.screen.height };
+let params = null;
+let lastT = null;
+let handSpeed = 0;
+let sent, ideal, sentTrail, idealTrail;
+
+function center() {
+  sent = { x: display.w / 2, y: display.h / 2 };
+  ideal = { ...sent };
+  sentTrail = [];
+  idealTrail = [];
+}
+center();
+
+const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+
+// Stessa curva del firmware (accelGain in main.cpp).
+function gain(speed) {
+  const { acc_lo: lo, acc_hi: hi, acc_max: max } = params;
+  if (hi <= lo) return speed < lo ? 1 : max;
+  return 1 + (max - 1) * clamp((speed - lo) / (hi - lo), 0, 1);
+}
+
+// Pixel al secondo per una data velocità della mano, limite del report compreso.
+function cursorSpeed(speed) {
+  if (speed < params.deadzone) return 0;
+  return Math.min(speed * params.sens * gain(speed), 127 * 1000 / params.send_ms);
+}
+
+function onSample([t, gx, gy, gz, dx, dy]) {
+  sent.x = clamp(sent.x + dx, 0, display.w);
+  sent.y = clamp(sent.y + dy, 0, display.h);
+  sentTrail.push({ t, x: sent.x, y: sent.y });
+
+  const dt = lastT === null ? 0 : t - lastT;
+  lastT = t;
+  if (params && dt > 0 && dt < 0.5) {
+    const g = [gx - params.bias_x, gy - params.bias_y, gz - params.bias_z];
+    const vx = params.x_gx * g[0] + params.x_gy * g[1] + params.x_gz * g[2];
+    const vy = params.y_gx * g[0] + params.y_gy * g[1] + params.y_gz * g[2];
+    handSpeed = Math.hypot(vx, vy);
+    ideal.x = clamp(ideal.x + vx * dt * params.sens, 0, display.w);
+    ideal.y = clamp(ideal.y + vy * dt * params.sens, 0, display.h);
+    idealTrail.push({ t, x: ideal.x, y: ideal.y });
+    $("gyro").textContent = g.map(v => String(Math.round(v) + 0).padStart(5)).join("");
+    $("speed").textContent = handSpeed.toFixed(0);
+    $("cursorSpeed").textContent = (Math.hypot(dx, dy) / dt).toFixed(0);
+  }
+  for (const trail of [sentTrail, idealTrail]) {
+    while (trail.length && t - trail[0].t > TRAIL_SECONDS) trail.shift();
+  }
+  const ox = Math.round(sent.x - display.w / 2), oy = Math.round(sent.y - display.h / 2);
+  $("offset").textContent = `${ox >= 0 ? "+" : ""}${ox}  ${oy >= 0 ? "+" : ""}${oy}`;
+}
+
+// --- disegno ---
+
+function prepare(canvas, cssHeight) {
+  const ratio = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth;
+  if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(cssHeight * ratio)) {
+    canvas.style.height = cssHeight + "px";
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(cssHeight * ratio);
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, cssHeight);
+  return [context, width, cssHeight];
+}
+
+function drawTrail(context, trail, color, k) {
+  const now = trail.length ? trail[trail.length - 1].t : 0;
+  context.strokeStyle = color;
+  context.lineWidth = 2;
+  for (let i = 1; i < trail.length; i++) {
+    context.globalAlpha = Math.max(0.05, 1 - (now - trail[i].t) / TRAIL_SECONDS);  // i tratti vecchi sbiadiscono
+    context.beginPath();
+    context.moveTo(trail[i - 1].x * k, trail[i - 1].y * k);
+    context.lineTo(trail[i].x * k, trail[i].y * k);
+    context.stroke();
+  }
+  context.globalAlpha = 1;
+}
+
+function drawScreen() {
+  const canvas = $("screen");
+  const [context, width, height] = prepare(canvas, canvas.clientWidth * display.h / display.w);
+  const k = width / display.w;
+  context.strokeStyle = COLORS.grid;
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(width / 2, 0); context.lineTo(width / 2, height);
+  context.moveTo(0, height / 2); context.lineTo(width, height / 2);
+  context.stroke();
+
+  if ($("showIdeal").checked) {
+    drawTrail(context, idealTrail, COLORS.ideal, k);
+    context.fillStyle = COLORS.ideal;
+    context.beginPath();
+    context.arc(ideal.x * k, ideal.y * k, 4, 0, 2 * Math.PI);
+    context.fill();
+  }
+  drawTrail(context, sentTrail, COLORS.sent, k);
+  context.fillStyle = "#ffffff";
+  context.strokeStyle = COLORS.sent;
+  context.lineWidth = 2;
+  context.beginPath();
+  context.arc(sent.x * k, sent.y * k, 6, 0, 2 * Math.PI);
+  context.fill();
+  context.stroke();
+  $("scale").textContent = `schermo ${display.w}×${display.h} px, disegnato in scala 1:${(1 / k).toFixed(1)}`;
+}
+
+function drawCurve() {
+  const [context, width, height] = prepare($("curve"), 150);
+  if (!params) return;
+  const left = 44, bottom = height - 18, top = 8, right = width - 6;
+  const maxSpeed = Math.max(600, params.acc_hi * 1.25);
+  const maxOut = Math.max(1, cursorSpeed(maxSpeed)) * 1.1;
+  const px = speed => left + (right - left) * speed / maxSpeed;
+  const py = out => bottom - (bottom - top) * out / maxOut;
+
+  context.strokeStyle = COLORS.grid;
+  context.lineWidth = 1;
+  context.strokeRect(left, top, right - left, bottom - top);
+  context.fillStyle = COLORS.text;
+  context.font = "11px system-ui, sans-serif";
+  context.textAlign = "right";
+  context.fillText(Math.round(maxOut / 1.1), left - 4, top + 10);
+  context.fillText("0", left - 4, bottom);
+  context.textAlign = "center";
+  context.fillText(Math.round(maxSpeed) + " °/s", right - 22, height - 4);
+
+  context.strokeStyle = COLORS.sent;
+  context.lineWidth = 2;
+  context.beginPath();
+  for (let x = left; x <= right; x++) {
+    const speed = (x - left) / (right - left) * maxSpeed;
+    context.lineTo(x, py(cursorSpeed(speed)));
+  }
+  context.stroke();
+
+  const speed = Math.min(handSpeed, maxSpeed);
+  context.fillStyle = "#ffffff";
+  context.beginPath();
+  context.arc(px(speed), py(cursorSpeed(speed)), 4, 0, 2 * Math.PI);
+  context.fill();
+}
+
+function frame() {
+  drawScreen();
+  drawCurve();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// --- regolazioni ---
+
+function post(path, body) {
+  return fetch(path, { method: "POST", body: body ? JSON.stringify(body) : null });
+}
+
+const pending = {};  // un invio in attesa per parametro: trascinando si spedisce al più ogni 80 ms
+
+function format(control, value) {
+  return `${+value.toFixed(2)} ${control.unit}`;
+}
+
+for (const control of CONTROLS) {
+  const label = document.createElement("label");
+  label.className = "slider";
+  label.innerHTML = `<div class="row"><span>${control.label}</span><output></output></div>
+    <input type="range" min="${control.min}" max="${control.max}" step="${control.step}">`;
+  $("sliders").append(label);
+  control.input = label.querySelector("input");
+  control.output = label.querySelector("output");
+  control.input.addEventListener("input", () => {
+    if (!params) return;
+    const value = Number(control.input.value);
+    params[control.name] = value;  // la curva si aggiorna subito, senza aspettare il dispositivo
+    control.output.textContent = format(control, value);
+    clearTimeout(pending[control.name]);
+    pending[control.name] = setTimeout(() => {
+      delete pending[control.name];
+      post("/set", { name: control.name, value });
+    }, 80);
+  });
+}
+
+function showParams(received) {
+  // Un valore ancora in viaggio verso il dispositivo non va sovrascritto con quello vecchio.
+  const local = params || {};
+  params = received;
+  for (const control of CONTROLS) {
+    if (control.name in pending) {
+      params[control.name] = local[control.name];
+      continue;
+    }
+    control.input.value = params[control.name];
+    control.output.textContent = format(control, params[control.name]);
+  }
+}
+
+function showStatus({ text, error }) {
+  $("status").textContent = text;
+  $("status").classList.toggle("error", Boolean(error));
+}
+
+$("center").addEventListener("click", center);
+$("bias").addEventListener("click", () => post("/bias"));
+$("save").addEventListener("click", () => post("/save"));
+$("reset").addEventListener("click", () => {
+  if (confirm("Riportare tutti i parametri ai valori iniziali?")) post("/reset");
+});
+document.addEventListener("keydown", event => {
+  if (event.key.toLowerCase() === "c" && !event.ctrlKey && !event.metaKey) center();
+});
+
+const events = new EventSource("/events");
+events.addEventListener("params", event => showParams(JSON.parse(event.data)));
+events.addEventListener("sample", event => onSample(JSON.parse(event.data)));
+events.addEventListener("status", event => showStatus(JSON.parse(event.data)));
+events.onerror = () => showStatus({ text: "Collegamento con eous_gui.py perso: è ancora in esecuzione?", error: true });
+</script>
+</body>
+</html>
