@@ -58,6 +58,8 @@ class Hub:
 def serial_worker(device, hub, commands, stop):
     """Unico thread che usa la seriale: inoltra i campioni ed esegue i comandi in coda."""
 
+    bias_updates = device.bias_updates
+
     def status(text, error=False):
         hub.publish("status", {"text": text, "error": error}, remember=True)
 
@@ -67,9 +69,14 @@ def serial_worker(device, hub, commands, stop):
 
     def forward(samples, seconds):
         """Inoltra i campioni alla pagina per `seconds` e li restituisce."""
+        nonlocal bias_updates
         taken = []
         for sample in samples:
-            hub.publish("sample", [round(sample.t, 4), *(round(g, 2) for g in sample.gyro), sample.dx, sample.dy])
+            hub.publish("sample", [round(sample.t, 4), *(round(g, 2) for g in sample.gyro),
+                                   sample.dx, sample.dy, sample.flags])
+            if device.bias_updates != bias_updates:  # il firmware ha corretto l'offset da solo
+                bias_updates = device.bias_updates
+                hub.publish("params", {**device.info, **device.params}, remember=True)
             taken.append(sample)
             if sample.t - taken[0].t >= seconds or stop.is_set():
                 return taken

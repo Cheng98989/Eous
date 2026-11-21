@@ -36,17 +36,25 @@
   .legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 6px; background: var(--accent); }
   .legend label { cursor: pointer; }
   .legend label i { background: var(--ideal); }
+  h3 { font-size: 13px; margin: 16px 0 8px; }
+  h3:first-of-type { margin-top: 0; }
+  select { width: 100%; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: #272b33; color: var(--text); font: inherit; }
+  label.check { display: block; margin-top: 12px; cursor: pointer; }
+  #badges { float: right; }
+  #badges span { margin-left: 8px; padding: 2px 8px; border-radius: 10px; background: var(--ideal); color: #14161a; font-size: 12px; font-weight: 600; visibility: hidden; }
+  #badges span.on { visibility: visible; }
 </style>
 </head>
 <body>
 <main>
   <div>
     <h1>Eous: cursore virtuale</h1>
+    <div id="badges"><span id="badge2">FRIZIONE</span><span id="badge4">BLOCCO AL CLICK</span><span id="badge1">SENSORE SATURO</span></div>
     <p id="status">Collegamento in corso...</p>
     <canvas id="screen"></canvas>
     <div class="legend">
       <span><i></i>movimento inviato dal firmware</span>
-      <label><input type="checkbox" id="showIdeal" checked> <i></i>solo sensibilità, senza accelerazione e zona morta</label>
+      <label><input type="checkbox" id="showIdeal" checked> <i></i>solo sensibilità: senza filtro, accelerazione, zona morta e blocchi</label>
       <span id="scale"></span>
     </div>
     <div class="readouts">
@@ -64,8 +72,12 @@
     <section>
       <h2>Regolazioni</h2>
       <div id="sliders"></div>
+      <label class="check"><input type="checkbox" id="autobias"> Correggi l'offset da solo a sensore fermo</label>
+    </section>
+    <section>
+      <h2>Curva di risposta</h2>
       <canvas id="curve" height="150"></canvas>
-      <p class="hint">Curva: velocità del cursore (px/s) in funzione della velocità della mano (°/s).
+      <p class="hint">Velocità del cursore (px/s) in funzione della velocità della mano (°/s).
         Il punto è la velocità di adesso.</p>
     </section>
     <section>
@@ -81,11 +93,19 @@
 
 <script>
 const CONTROLS = [
+  { group: "Movimento" },
   { name: "sens", label: "Sensibilità", unit: "px/°", min: 1, max: 40, step: 0.5 },
   { name: "deadzone", label: "Zona morta", unit: "°/s", min: 0, max: 5, step: 0.1 },
-  { name: "acc_max", label: "Accelerazione massima", unit: "×", min: 1, max: 6, step: 0.1 },
-  { name: "acc_lo", label: "Accelerazione: da", unit: "°/s", min: 0, max: 300, step: 5 },
-  { name: "acc_hi", label: "Accelerazione: fino a", unit: "°/s", min: 50, max: 1000, step: 10 },
+  { group: "Accelerazione" },
+  { name: "acc_max", label: "Massima", unit: "×", min: 1, max: 6, step: 0.1 },
+  { name: "acc_lo", label: "Da", unit: "°/s", min: 0, max: 300, step: 5 },
+  { name: "acc_hi", label: "Fino a", unit: "°/s", min: 50, max: 1000, step: 10 },
+  { group: "Stabilizzazione" },
+  { name: "filt_hz", label: "Filtro a mano lenta (0 = spento)", unit: "Hz", min: 0, max: 10, step: 0.25 },
+  { name: "filt_beta", label: "Filtro: apertura con la velocità", unit: "Hz per °/s", min: 0, max: 0.5, step: 0.01 },
+  { name: "click_ms", label: "Blocco al click", unit: "ms", min: 0, max: 300, step: 10 },
+  { group: "Frizione (contatto GPIO17 - GND)" },
+  { name: "clutch", options: ["Non usata", "Premuta per muovere", "Premuta per bloccare"] },
 ];
 const TRAIL_SECONDS = 8;
 const COLORS = { sent: "#4da3ff", ideal: "#f0a13a", grid: "#2f343d", text: "#9299a6" };
@@ -121,7 +141,13 @@ function cursorSpeed(speed) {
   return Math.min(speed * params.sens * gain(speed), 127 * 1000 / params.send_ms);
 }
 
-function onSample([t, gx, gy, gz, dx, dy]) {
+const badgeUntil = {};
+
+function onSample([t, gx, gy, gz, dx, dy, flags]) {
+  for (const bit of [1, 2, 4]) {
+    if (flags & bit) badgeUntil[bit] = performance.now() + 300;  // resta visibile anche per un blocco breve
+    $("badge" + bit).classList.toggle("on", badgeUntil[bit] > performance.now());
+  }
   sent.x = clamp(sent.x + dx, 0, display.w);
   sent.y = clamp(sent.y + dy, 0, display.h);
   sentTrail.push({ t, x: sent.x, y: sent.y });
@@ -261,7 +287,30 @@ function format(control, value) {
   return `${+value.toFixed(2)} ${control.unit}`;
 }
 
+function send(name, value) {
+  if (!params) return;
+  params[name] = value;  // la curva si aggiorna subito, senza aspettare il dispositivo
+  clearTimeout(pending[name]);
+  pending[name] = setTimeout(() => {
+    delete pending[name];
+    post("/set", { name, value });
+  }, 80);
+}
+
 for (const control of CONTROLS) {
+  if (control.group) {
+    const title = document.createElement("h3");
+    title.textContent = control.group;
+    $("sliders").append(title);
+    continue;
+  }
+  if (control.options) {
+    control.input = document.createElement("select");
+    control.options.forEach((text, value) => control.input.add(new Option(text, value)));
+    control.input.addEventListener("change", () => send(control.name, Number(control.input.value)));
+    $("sliders").append(control.input);
+    continue;
+  }
   const label = document.createElement("label");
   label.className = "slider";
   label.innerHTML = `<div class="row"><span>${control.label}</span><output></output></div>
@@ -270,30 +319,24 @@ for (const control of CONTROLS) {
   control.input = label.querySelector("input");
   control.output = label.querySelector("output");
   control.input.addEventListener("input", () => {
-    if (!params) return;
     const value = Number(control.input.value);
-    params[control.name] = value;  // la curva si aggiorna subito, senza aspettare il dispositivo
     control.output.textContent = format(control, value);
-    clearTimeout(pending[control.name]);
-    pending[control.name] = setTimeout(() => {
-      delete pending[control.name];
-      post("/set", { name: control.name, value });
-    }, 80);
+    send(control.name, value);
   });
 }
+$("autobias").addEventListener("change", () => send("autobias", $("autobias").checked ? 1 : 0));
 
 function showParams(received) {
   // Un valore ancora in viaggio verso il dispositivo non va sovrascritto con quello vecchio.
   const local = params || {};
   params = received;
+  for (const name in pending) params[name] = local[name];
   for (const control of CONTROLS) {
-    if (control.name in pending) {
-      params[control.name] = local[control.name];
-      continue;
-    }
+    if (!control.input || control.name in pending) continue;
     control.input.value = params[control.name];
-    control.output.textContent = format(control, params[control.name]);
+    if (control.output) control.output.textContent = format(control, params[control.name]);
   }
+  if (!("autobias" in pending)) $("autobias").checked = params.autobias !== 0;
 }
 
 function showStatus({ text, error }) {

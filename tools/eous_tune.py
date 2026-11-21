@@ -31,10 +31,17 @@ DESCRIPTIONS = {
     "acc_lo": "accelerazione: velocità della mano (°/s) da cui inizia",
     "acc_hi": "accelerazione: velocità della mano (°/s) da cui è massima",
     "acc_max": "accelerazione: moltiplicatore massimo (1 = spenta)",
+    "filt_hz": "filtro: frequenza di taglio a mano ferma, Hz (0 = spento)",
+    "filt_beta": "filtro: Hz di taglio in più per ogni °/s di velocità",
+    "clutch": "frizione su GPIO17: 0 = no, 1 = premuta per muovere, 2 = premuta per bloccare",
+    "click_ms": "ms di cursore fermo dopo ogni pressione o rilascio di un pulsante",
+    "autobias": "1 = l'offset si corregge da solo quando il sensore è fermo",
 }
 
-# t: secondi dal primo campione; acc: g; gyro: °/s (offset incluso); raw: giroscopio grezzo.
-Sample = collections.namedtuple("Sample", "t acc gyro raw dx dy")
+# Un campione per ogni report del mouse. t: secondi dal primo campione; acc: g;
+# gyro: °/s medi dall'ultimo report (offset incluso); dx, dy: pixel inviati; flags: stato.
+Sample = collections.namedtuple("Sample", "t acc gyro dx dy flags")
+SATURATED, CLUTCHED, CLICKING = 1, 2, 4  # bit di Sample.flags
 
 
 class DeviceError(Exception):
@@ -168,6 +175,7 @@ class Device:
             self.ser.dtr = False
         self.buffer = b""
         self.backlog = []  # righe di dati arrivate mentre si aspettava la risposta a un comando
+        self.bias_updates = 0  # quante volte il firmware ha comunicato un nuovo offset
         self.info = {}
         self.params = {}
         self._connect()
@@ -193,7 +201,7 @@ class Device:
                 raise DeviceError(f"{text}: {line[4:]}")
             if line[:2] in ("I,", "P,"):
                 reply.append(line)
-            elif line.startswith("D,"):
+            elif line[:2] in ("D,", "B,"):
                 self.backlog.append(line)
         raise DeviceError(f"nessuna risposta al comando '{text}'")
 
@@ -257,17 +265,23 @@ class Device:
             if line is None:
                 raise DeviceError("il sensore non manda dati: controlla i messaggi [MPU] all'avvio")
             parts = line.split(",")
-            if parts[0] != "D" or len(parts) != 10:
+            if parts[0] == "B" and len(parts) == 4:
+                # Il firmware ha corretto da solo l'offset del giroscopio.
+                with contextlib.suppress(ValueError):
+                    self.params.update(zip(("bias_x", "bias_y", "bias_z"), map(float, parts[1:])))
+                    self.bias_updates += 1
+                continue
+            if parts[0] != "D" or len(parts) != 11:
                 continue
             try:
-                us, ax, ay, az, gx, gy, gz, dx, dy = (int(p) for p in parts[1:])
+                us, ax, ay, az, gx, gy, gz, dx, dy, flags = (int(p) for p in parts[1:])
             except ValueError:
                 continue
             if last_us is not None:
                 t += ((us - last_us) & 0xFFFFFFFF) / 1e6  # il contatore riparte da zero dopo 71 minuti
             last_us = us
             yield Sample(t, scale([ax, ay, az], 1 / lsb_g), scale([gx, gy, gz], 1 / lsb_dps),
-                         (gx, gy, gz), dx, dy)
+                         dx, dy, flags)
 
     def record(self, seconds):
         with self.stream() as samples:
@@ -325,7 +339,7 @@ class Shell(cmd.Cmd):
         for label, row in zip("XY", self.rows()):
             terms = " ".join(f"{k:+.3f}·g{a}" for k, a in zip(row, "xyz"))
             print(f"  cursore {label} = {terms}")
-        print(f"  offset giroscopio: {fmt(self.device_bias())} °/s (rimisurato a ogni avvio)")
+        print(f"  offset giroscopio: {fmt(self.device_bias())} °/s")
 
     def do_set(self, arg):
         """set NOME VALORE [NOME VALORE ...]: cambia uno o più parametri, subito attivi.
@@ -388,10 +402,10 @@ class Shell(cmd.Cmd):
         recorded = self.dev.record(seconds)
         with open(path, "w", newline="") as file:
             writer = csv.writer(file)
-            writer.writerow(["t_s", "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "dx", "dy"])
+            writer.writerow(["t_s", "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "dx", "dy", "flags"])
             for s in recorded:
                 writer.writerow([f"{s.t:.4f}", *(f"{v:.4f}" for v in s.acc),
-                                 *(f"{v:.3f}" for v in s.gyro), s.dx, s.dy])
+                                 *(f"{v:.3f}" for v in s.gyro), s.dx, s.dy, s.flags])
         print(f"{len(recorded)} campioni salvati in {path}")
 
     # --- calibrazioni ---
@@ -414,7 +428,7 @@ class Shell(cmd.Cmd):
         print(f"  L'offset usato finora dal dispositivo differiva di {change:.2f} °/s.")
         for axis, value in zip("xyz", bias):
             self.dev.set(f"bias_{axis}", value)
-        print("  Offset aggiornato (vale fino al prossimo riavvio, che lo rimisura).")
+        print("  Offset aggiornato.")
         print(f"  Zona morta: il rumore del sensore permetterebbe {max(0.2, 6 * max(noise)):.1f} °/s; "
               f"ora è {self.dev.params['deadzone']:g}. Di solito comanda il tremolio della mano: prova.")
 
@@ -478,7 +492,8 @@ class Shell(cmd.Cmd):
         duration = recorded[-1].t - recorded[0].t
         period = self.dev.info["send_ms"] / 1000
         lost = sum(1 for a, b in zip(recorded, recorded[1:]) if b.t - a.t > 1.5 * period)
-        saturated = sum(1 for s in recorded if max(map(abs, s.raw)) >= 32767)
+        saturated = sum(1 for s in recorded if s.flags & SATURATED)
+        frozen = sum(1 for s in recorded if s.flags & (CLUTCHED | CLICKING))
         peak = max(norm(sub(s.gyro, bias)) for s in recorded)
         expected = [dot(x_row, per_axis) * p["sens"], dot(y_row, per_axis) * p["sens"]]
         sent = [sum(s.dx for s in recorded), sum(s.dy for s in recorded)]
@@ -516,7 +531,11 @@ class Shell(cmd.Cmd):
                 "geometrico: le rotazioni nello spazio non si sommano asse per asse, e l'errore cresce "
                 "quando il polso ruota anche su se stesso. Nessuna calibrazione lo toglie: serve "
                 "correggere gli assi con l'accelerometro nel firmware.")
-        if norm(sub(sent, expected)) > tolerance_px:
+        if frozen:
+            findings.append(
+                f"Per {frozen * period:.1f} s il cursore è rimasto fermo per la frizione o per il blocco "
+                "al click: il movimento fatto in quel tempo non è stato inviato.")
+        elif norm(sub(sent, expected)) > tolerance_px:
             findings.append(
                 "Il firmware ha inviato un movimento diverso dalla somma degli angoli: è l'effetto di "
                 "zona morta, accelerazione (acc_max) o limite del report. Con l'accelerazione attiva è "
