@@ -32,10 +32,19 @@ usa il proprio supporto per mouse Bluetooth, senza un'applicazione dedicata.
 - Il contatto tra GPIO15 e GND attiva il pulsante sinistro; quello tra GPIO16
   e GND attiva il destro. Mantenendo chiuso il contatto si tiene premuto il pulsante,
   anche per trascinare.
-- Il firmware applica un antirimbalzo di 20 ms ai contatti e invia lo stato del mouse
-  ogni 20 ms quando il computer ha abilitato le notifiche HID.
-- All'avvio il giroscopio viene calibrato. Se il sensore non è disponibile o la
-  calibrazione fallisce, i pulsanti continuano a funzionare.
+- Il contatto tra GPIO17 e GND è la frizione: finché è chiuso il cursore resta
+  fermo, come quando si solleva un mouse per riposizionare la mano. Il
+  comportamento si può invertire o disattivare.
+- Il firmware applica un antirimbalzo di 20 ms ai contatti, legge il sensore
+  ogni 5 ms e invia lo stato del mouse ogni 10 ms quando il computer ha abilitato
+  le notifiche HID.
+- Un filtro smorza il tremolio a mano lenta senza ritardare i movimenti veloci,
+  e il cursore resta fermo per un istante dopo ogni pressione o rilascio di un
+  pulsante, perché il gesto del clic non lo sposti.
+- L'offset del giroscopio viene misurato all'avvio e corretto ogni volta che il
+  sensore resta fermo per due secondi. Se all'avvio il sensore si muove, viene
+  usato l'ultimo offset salvato. Se il sensore non è disponibile, i pulsanti
+  continuano a funzionare.
 - Sensibilità, zona morta, accelerazione del cursore e orientamento del sensore
   si regolano dal computer attraverso la porta seriale, senza ricompilare.
 
@@ -86,12 +95,14 @@ tuo modulo prima di collegare VCC; SDA e SCL devono usare livelli logici a 3,3 V
 | --- | --- | --- | --- |
 | Sinistro | GPIO15 | GND | Pulsante sinistro premuto |
 | Destro | GPIO16 | GND | Pulsante destro premuto |
-| Eventuali contatti aggiuntivi | GPIO17 / GPIO18 | Lasciare scollegati per l'uso attuale | Nessuna azione mouse |
+| Frizione (facoltativa) | GPIO17 | GND | Cursore fermo finché il contatto è chiuso |
+| Eventuale contatto aggiuntivo | GPIO18 | Lasciare scollegato per l'uso attuale | Nessuna azione mouse |
 
-GPIO15 e GPIO16 usano `INPUT_PULLUP`: a riposo il contatto è aperto e il livello
-è HIGH; chiudendolo verso GND diventa LOW. La pull-up è interna, quindi per questi
-contatti non serve una resistenza di pull-up esterna. GPIO17 e GPIO18 sono
-configurati come ingressi con pull-up, ma non generano eventi mouse.
+GPIO15, GPIO16 e GPIO17 usano `INPUT_PULLUP`: a riposo il contatto è aperto e il
+livello è HIGH; chiudendolo verso GND diventa LOW. La pull-up è interna, quindi per
+questi contatti non serve una resistenza di pull-up esterna. Senza nulla collegato
+a GPIO17 la frizione non interviene. GPIO18 è configurato come ingresso con pull-up,
+ma non genera eventi mouse.
 
 ```text
 ESP32-S3                         MPU6050
@@ -103,6 +114,7 @@ GND ---------------------------- AD0
 
 GPIO15 ---- [contatto sinistro] -- GND
 GPIO16 ---- [contatto destro] ---- GND
+GPIO17 ---- [frizione] ----------- GND
 
 Computer -- USB ---------------- ESP32-S3 (alimentazione / caricamento / log)
 Computer <------ Bluetooth -----> ESP32-S3 (mouse BLE HID)
@@ -142,14 +154,15 @@ principale; i programmi sperimentali restano esclusi.
 ### Avvio e associazione Bluetooth
 
 1. All'accensione o al riavvio, tieni fermo il sensore durante la calibrazione
-   (circa un secondo di campionamento, dopo il ritardo iniziale).
+   (circa un secondo di campionamento, dopo il ritardo iniziale). Se si muove,
+   il firmware riprova due volte e poi usa l'ultimo offset salvato.
 2. Nel monitor seriale controlla il messaggio `[MPU] pronto`. Il firmware usa
    attualmente messaggi seriali in italiano.
 3. Apri le impostazioni Bluetooth del computer e associa **Eous Mouse**.
 4. Ruota il sensore per muovere il cursore e chiudi i contatti per provare i clic.
 
 Dopo una disconnessione l'ESP32-S3 riprende l'annuncio Bluetooth. Per ricalibrare
-il giroscopio riavvia la scheda mantenendo fermo il sensore.
+il giroscopio basta appoggiare il sensore e lasciarlo fermo per due secondi.
 
 <a id="it-regolazioni"></a>
 ### Regolazioni
@@ -159,10 +172,12 @@ Le costanti si trovano all'inizio di [main.cpp](firmware/src/main.cpp).
 | Costante | Valore attuale | Effetto |
 | --- | --- | --- |
 | `LEFT_PIN` / `RIGHT_PIN` | `15` / `16` | GPIO dei contatti sinistro e destro |
+| `CLUTCH_PIN` | `17` | GPIO del contatto della frizione |
 | `SDA_PIN` / `SCL_PIN` | `8` / `9` | GPIO del bus I²C |
 | `MPU_ADDR` | `0x68` | Indirizzo del sensore con AD0 a GND |
 | `DEBOUNCE_MS` | `20` | Tempo di antirimbalzo dei contatti |
-| `SEND_MS` | `20` | Intervallo tra i report mouse, in millisecondi |
+| `SAMPLE_MS` | `5` | Intervallo tra le letture del sensore, in millisecondi |
+| `SAMPLES_PER_REPORT` | `2` | Letture del sensore per ogni report mouse (un report ogni 10 ms) |
 
 Dopo ogni modifica ricompila e ricarica il firmware. Sensibilità, zona morta,
 accelerazione e versi di movimento non sono costanti: si cambiano dal computer,
@@ -197,6 +212,11 @@ python tools/eous_tune.py
 | `deadzone` | `1` | Velocità in gradi/s sotto cui il cursore resta fermo |
 | `acc_lo` / `acc_hi` | `50` / `400` | Velocità della mano, in gradi/s, tra cui l'accelerazione cresce |
 | `acc_max` | `1` | Moltiplicatore massimo dell'accelerazione; `1` la disattiva |
+| `filt_hz` | `3` | Filtro: frequenza di taglio a mano ferma, in Hz; più bassa smorza di più, `0` lo spegne |
+| `filt_beta` | `0.1` | Filtro: di quanti Hz sale il taglio per ogni grado/s di velocità della mano |
+| `click_ms` | `120` | Millisecondi di cursore fermo dopo ogni pressione o rilascio di un pulsante; `0` lo disattiva |
+| `clutch` | `2` | Frizione: `0` non usata, `1` contatto chiuso per muovere, `2` contatto chiuso per bloccare |
+| `autobias` | `1` | `1` corregge l'offset del giroscopio da solo a sensore fermo |
 | `x_gx` … `y_gz` | X = −gz, Y = −gx | Contributo di ogni asse del giroscopio al movimento del cursore |
 
 [tools/eous_gui.py](tools/eous_gui.py) offre le stesse regolazioni in una pagina
@@ -239,7 +259,7 @@ verso GND del firmware principale.
 | Problema | Controlli |
 | --- | --- |
 | Sensore non disponibile o calibrazione fallita | Controlla alimentazione, massa comune, SDA su GPIO8, SCL su GPIO9 e AD0 a GND, poi riavvia. I clic restano disponibili. |
-| Cursore che si muove a riposo | Riavvia tenendo fermo il sensore; se necessario esegui `bias` o aumenta `deadzone` con `eous_tune.py`. |
+| Cursore che si muove a riposo | Appoggia il sensore e lascialo fermo per due secondi: l'offset si corregge da solo. Se necessario aumenta `deadzone`. |
 | Clic non rilevati | Verifica che ogni contatto chiuda il GPIO corretto verso GND e che il mouse sia connesso. |
 | Mouse non visibile o associazione non riuscita | Controlla alimentazione e messaggi seriali; se esiste una vecchia associazione, rimuovila dal computer e ripeti l'associazione. |
 | Nessun messaggio seriale | Controlla cavo USB dati, porta selezionata e velocità di 115200 baud; riavvia con il monitor aperto per leggere i messaggi iniziali. |
@@ -283,10 +303,18 @@ mouse support, without a dedicated application.
 - Closing the contact between GPIO15 and GND presses the left mouse button;
   GPIO16 to GND presses the right button. Keeping a contact closed holds the
   button down, including for dragging.
-- The firmware debounces contacts for 20 ms and sends the mouse state every
-  20 ms when the computer has enabled HID notifications.
-- The gyroscope is calibrated at startup. If the sensor is unavailable or
-  calibration fails, the buttons keep working.
+- The contact between GPIO17 and GND is the clutch: while it is closed the
+  pointer stays still, like lifting a mouse to reposition your hand. The
+  behaviour can be inverted or turned off.
+- The firmware debounces contacts for 20 ms, reads the sensor every 5 ms and
+  sends the mouse state every 10 ms when the computer has enabled HID
+  notifications.
+- A filter damps tremor when the hand moves slowly without delaying fast
+  movements, and the pointer stays still for a moment after each button press
+  or release, so the click gesture does not move it.
+- The gyroscope offset is measured at startup and corrected whenever the sensor
+  stays still for two seconds. If the sensor is moving at startup, the last
+  stored offset is used. If the sensor is unavailable, the buttons keep working.
 - Sensitivity, deadzone, pointer acceleration and sensor orientation are tuned
   from the computer over the serial port, without rebuilding.
 
@@ -336,12 +364,14 @@ before connecting VCC; SDA and SCL must use 3.3 V logic levels.
 | --- | --- | --- | --- |
 | Left | GPIO15 | GND | Left mouse button held down |
 | Right | GPIO16 | GND | Right mouse button held down |
-| Any additional contacts | GPIO17 / GPIO18 | Leave disconnected for current use | No mouse action |
+| Clutch (optional) | GPIO17 | GND | Pointer held still while the contact is closed |
+| Any additional contact | GPIO18 | Leave disconnected for current use | No mouse action |
 
-GPIO15 and GPIO16 use `INPUT_PULLUP`: an open contact reads HIGH, and closing it
-to GND reads LOW. The pull-up is internal, so these contacts do not need external
-pull-up resistors. GPIO17 and GPIO18 are configured as inputs with pull-ups but
-do not generate mouse events.
+GPIO15, GPIO16 and GPIO17 use `INPUT_PULLUP`: an open contact reads HIGH, and
+closing it to GND reads LOW. The pull-up is internal, so these contacts do not need
+external pull-up resistors. With nothing connected to GPIO17 the clutch never
+engages. GPIO18 is configured as an input with a pull-up but does not generate
+mouse events.
 
 ```text
 ESP32-S3                         MPU6050
@@ -353,6 +383,7 @@ GND ---------------------------- AD0
 
 GPIO15 ---- [left contact] ------ GND
 GPIO16 ---- [right contact] ----- GND
+GPIO17 ---- [clutch] ------------ GND
 
 Computer -- USB ---------------- ESP32-S3 (power / upload / logs)
 Computer <------ Bluetooth -----> ESP32-S3 (BLE HID mouse)
@@ -392,14 +423,15 @@ experimental programs are excluded.
 ### Startup and Bluetooth pairing
 
 1. At power-on or reset, keep the sensor still during calibration (about one
-   second of sampling, after the initial delay).
+   second of sampling, after the initial delay). If it moves, the firmware
+   retries twice and then uses the last stored offset.
 2. Check the serial monitor for `[MPU] pronto` (sensor ready). The firmware's
    serial messages are currently in Italian.
 3. Open your computer's Bluetooth settings and pair **Eous Mouse**.
 4. Rotate the sensor to move the pointer and close the contacts to test clicks.
 
 After a disconnection, the ESP32-S3 resumes Bluetooth advertising. To recalibrate
-the gyroscope, restart the board while keeping the sensor still.
+the gyroscope, put the sensor down and leave it still for two seconds.
 
 <a id="en-adjustments"></a>
 ### Adjustments
@@ -409,10 +441,12 @@ The constants are at the beginning of [main.cpp](firmware/src/main.cpp).
 | Constant | Current value | Effect |
 | --- | --- | --- |
 | `LEFT_PIN` / `RIGHT_PIN` | `15` / `16` | GPIO pins for the left and right contacts |
+| `CLUTCH_PIN` | `17` | GPIO pin for the clutch contact |
 | `SDA_PIN` / `SCL_PIN` | `8` / `9` | I²C bus GPIO pins |
 | `MPU_ADDR` | `0x68` | Sensor address with AD0 connected to GND |
 | `DEBOUNCE_MS` | `20` | Contact debounce time |
-| `SEND_MS` | `20` | Interval between mouse reports, in milliseconds |
+| `SAMPLE_MS` | `5` | Interval between sensor readings, in milliseconds |
+| `SAMPLES_PER_REPORT` | `2` | Sensor readings per mouse report (one report every 10 ms) |
 
 Rebuild and upload the firmware after each change. Sensitivity, deadzone,
 acceleration and movement directions are not constants: they are changed from
@@ -448,6 +482,11 @@ python tools/eous_tune.py
 | `deadzone` | `1` | Speed in degrees/s below which the pointer stays still |
 | `acc_lo` / `acc_hi` | `50` / `400` | Hand speeds, in degrees/s, between which acceleration ramps up |
 | `acc_max` | `1` | Maximum acceleration multiplier; `1` turns it off |
+| `filt_hz` | `3` | Filter: cutoff frequency with the hand still, in Hz; lower damps more, `0` turns it off |
+| `filt_beta` | `0.1` | Filter: how many Hz the cutoff rises per degree/s of hand speed |
+| `click_ms` | `120` | Milliseconds the pointer stays still after each button press or release; `0` turns it off |
+| `clutch` | `2` | Clutch: `0` unused, `1` contact closed to move, `2` contact closed to hold still |
+| `autobias` | `1` | `1` corrects the gyroscope offset automatically while the sensor is still |
 | `x_gx` … `y_gz` | X = −gz, Y = −gx | Contribution of each gyroscope axis to pointer movement |
 
 [tools/eous_gui.py](tools/eous_gui.py) offers the same adjustments in a browser
@@ -490,7 +529,7 @@ firmware's contacts to GND.
 | Problem | Checks |
 | --- | --- |
 | Sensor unavailable or calibration failed | Check power, common ground, SDA on GPIO8, SCL on GPIO9 and AD0 to GND, then restart. Clicks remain available. |
-| Pointer moves while the sensor is still | Restart while keeping the sensor still; if needed run `bias` or raise `deadzone` with `eous_tune.py`. |
+| Pointer moves while the sensor is still | Put the sensor down and leave it still for two seconds: the offset corrects itself. Raise `deadzone` if needed. |
 | Clicks are not detected | Check that each contact closes the correct GPIO to GND and that the mouse is connected. |
 | Mouse is not visible or pairing fails | Check power and serial messages; if an old pairing exists, remove it from the computer and pair again. |
 | No serial messages | Check the USB data cable, selected port and 115200 baud rate; restart with the monitor open to read startup messages. |
