@@ -8,12 +8,12 @@
 
 // Eous: mouse BLE HID. Il computer usa il proprio supporto mouse Bluetooth.
 // MPU6050: SDA -> GPIO8, SCL -> GPIO9, AD0 -> GND, massa comune.
-// Pulsanti e frizione: chiudere il contatto tra il relativo GPIO e GND.
+// Pad delle dita: ognuno chiude il contatto tra il proprio GPIO e il pollice, collegato a GND.
 // Calibrazione e regolazioni dal PC, via seriale: tools/eous_tune.py e tools/eous_gui.py.
 constexpr uint8_t LEFT_PIN = 15;
 constexpr uint8_t RIGHT_PIN = 16;
 constexpr uint8_t CLUTCH_PIN = 17;
-constexpr uint8_t UNUSED_PINS[] = {18};
+constexpr uint8_t EXTRA_PIN = 18;  // Nessuna funzione mouse: solo gesti.
 constexpr int SDA_PIN = 8;
 constexpr int SCL_PIN = 9;
 constexpr uint8_t MPU_ADDR = 0x68;
@@ -21,7 +21,7 @@ constexpr uint32_t DEBOUNCE_MS = 20;
 constexpr uint32_t SAMPLE_MS = 5;           // Il sensore viene letto 200 volte al secondo...
 constexpr uint32_t SAMPLES_PER_REPORT = 2;  // ...e ogni due letture parte un report mouse.
 constexpr uint32_t SEND_MS = SAMPLE_MS * SAMPLES_PER_REPORT;
-constexpr float LSB_PER_DPS = 32.8f;   // Scala +-1000 gradi/s: a +-250 un movimento rapido del polso satura.
+constexpr float LSB_PER_DPS = 16.4f;   // Scala +-2000 gradi/s: una rotazione rapida del polso supera i 1000.
 constexpr float LSB_PER_G = 16384.0f;  // Scala +-2 g dell'accelerometro.
 
 // Riconoscimento del sensore fermo, usato per misurare l'offset del giroscopio.
@@ -31,6 +31,13 @@ constexpr float STILL_AGREE_DPS = 0.3f;      // Due finestre ferme di fila devon
 constexpr float MAX_BIAS_DPS = 20.0f;        // Offset massimo dichiarato dal costruttore del sensore.
 constexpr float BIAS_STORE_DPS = 0.2f;       // Sotto questa variazione non si riscrive la memoria flash.
 
+// Riconoscimento dei gesti.
+constexpr uint32_t COMBO_SETTLE_MS = 50;     // Pad chiusi insieme: si aspetta che il gruppo smetta di crescere.
+constexpr float GESTURE_MOVE_DPS = 25.0f;    // Sopra questa velocita' la mano si sta muovendo.
+constexpr uint32_t QUIET_MS = 120;           // Ferma per questo tempo = movimento finito.
+constexpr uint32_t DECIDE_MS = 300;          // Dopo il primo tratto veloce si decide entro questo tempo.
+constexpr uint32_t RETURN_MS = 400;          // Un gesto opposto entro questo tempo e' la mano che torna indietro.
+
 // Parametri regolabili via seriale senza ricompilare. Il comando "save" scrive
 // nella memoria flash quelli fino a SAVED_PARAMS; l'offset del giroscopio cambia
 // con la temperatura, quindi il firmware lo rimisura da solo e ne salva una copia
@@ -38,6 +45,7 @@ constexpr float BIAS_STORE_DPS = 0.2f;       // Sotto questa variazione non si r
 enum ParamId {
   SENS, DEADZONE, ACC_LO, ACC_HI, ACC_MAX,
   FILT_HZ, FILT_BETA, CLUTCH, CLICK_MS, AUTOBIAS,
+  HOLD_MS, DBL_MS, G_PEAK, G_ANGLE, FLIP_DEG, FLIP_MS, SHAKE_N,
   X_GX, X_GY, X_GZ, Y_GX, Y_GY, Y_GZ,
   SAVED_PARAMS,
   BIAS_X = SAVED_PARAMS, BIAS_Y, BIAS_Z,
@@ -61,6 +69,13 @@ static Param params[PARAM_COUNT] = {
     {"clutch", 2.0f},    // Frizione su CLUTCH_PIN: 0 = non usata, 1 = premuta per muovere, 2 = premuta per bloccare.
     {"click_ms", 120.0f},// Il cursore resta fermo per questo tempo dopo ogni pressione o rilascio di un pulsante.
     {"autobias", 1.0f},  // 1 = l'offset si corregge da solo quando il sensore resta fermo.
+    {"hold_ms", 400.0f}, // Pad: chiuso piu' a lungo di cosi' diventa "tenuto".
+    {"dbl_ms", 250.0f},  // Pad: pausa massima tra due tocchi di un doppio tocco.
+    {"g_peak", 150.0f},  // Gesti: velocita' di picco minima di un tratto, gradi/s.
+    {"g_angle", 15.0f},  // Scatto: ampiezza minima, gradi.
+    {"flip_deg", 90.0f}, // Rotazione rapida: ampiezza minima, gradi.
+    {"flip_ms", 400.0f}, // Rotazione rapida: durata massima, millisecondi.
+    {"shake_n", 3.0f},   // Scossa: tratti veloci minimi in direzioni alternate.
     // Cursore X = x_gx*gx + x_gy*gy + x_gz*gz (positivo = destra);
     // cursore Y = y_gx*gx + y_gy*gy + y_gz*gz (positivo = giu').
     {"x_gx", 0.0f}, {"x_gy", 0.0f}, {"x_gz", -1.0f},
@@ -86,9 +101,11 @@ struct Button {
   }
 };
 
-static Button leftButton{LEFT_PIN};
-static Button rightButton{RIGHT_PIN};
-static Button clutchButton{CLUTCH_PIN};
+static Button pads[] = {{LEFT_PIN}, {RIGHT_PIN}, {CLUTCH_PIN}, {EXTRA_PIN}};
+constexpr uint8_t PAD_COUNT = sizeof(pads) / sizeof(pads[0]);
+static Button& leftButton = pads[0];
+static Button& rightButton = pads[1];
+static Button& clutchButton = pads[2];
 static NimBLECharacteristic* mouseReport = nullptr;
 static std::atomic<bool> reportSubscribed{false};
 static bool mpuReady = false;
@@ -386,15 +403,284 @@ static void smooth(float& stepX, float& stepY, float speed, float dt) {
   lagY -= stepY;
 }
 
-// Elabora una lettura del sensore e accumula i pixel da inviare.
+// ---------- Gesti ----------
+// Eventi per il PC, una riga ciascuno: G,tipo,dettaglio,durata ms,ampiezza gradi,picco gradi/s.
+static void sendGesture(const char* type, const char* detail, uint32_t ms, float angle = 0, float peak = 0) {
+  Serial.printf("G,%s,%s,%lu,%.0f,%.0f\n", type, detail, static_cast<unsigned long>(ms), angle, peak);
+}
+
+// Il dettaglio dei pad sono i loro GPIO, per esempio "15+16".
+static void sendPadGesture(const char* type, uint8_t mask, uint32_t ms) {
+  char detail[16] = "";
+  size_t used = 0;
+  for (uint8_t i = 0; i < PAD_COUNT; ++i) {
+    if (mask & (1 << i)) used += snprintf(detail + used, sizeof(detail) - used, used ? "+%u" : "%u", pads[i].pin);
+  }
+  sendGesture(type, detail, ms);
+}
+
+static uint8_t padMask() {
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < PAD_COUNT; ++i) {
+    if (pads[i].pressed) mask |= 1 << i;
+  }
+  return mask;
+}
+
+// Pad: ogni pad e' una piccola macchina a stati che produce tocco, doppio tocco,
+// tenuto e il rilascio del tenuto. Per distinguere un tocco da un doppio tocco
+// bisogna aspettare dbl_ms: e' il ritardo inevitabile dei tocchi.
+enum PadPhase : uint8_t {
+  PAD_IDLE,    // Aperto, nessuna primitiva in corso.
+  PAD_DOWN,    // Chiuso da meno di hold_ms.
+  PAD_WAIT,    // Appena riaperto: si aspetta un eventuale secondo tocco.
+  PAD_HELD,    // Chiuso da piu' di hold_ms: "tenuto" gia' inviato.
+  PAD_IGNORE,  // Primitiva gia' decisa o annullata: si aspetta solo che il pad si apra.
+};
+
+struct PadState {
+  PadPhase phase = PAD_IDLE;
+  bool was = false;      // Stato al giro precedente, per riconoscere chiusura e apertura.
+  uint32_t since = 0;    // Inizio della fase attuale.
+  uint32_t pressMs = 0;  // Durata del tocco, riportata con "tocco".
+};
+
+static PadState padStates[PAD_COUNT];
+
+// Due o piu' pad chiusi insieme formano una combinazione, inviata quando il
+// gruppo smette di crescere. I pad coinvolti non producono primitive proprie,
+// tranne un "tenuto" gia' inviato, che ricevera' comunque il suo rilascio.
+static void updateCombo(uint8_t mask, uint32_t now) {
+  static bool active = false;
+  static uint8_t group = 0, sent = 0;
+  static uint32_t grewAt = 0;
+  if (!active && __builtin_popcount(mask) < 2) return;
+  if (!active) {
+    active = true;
+    group = sent = 0;
+  }
+  if (mask & ~group) {
+    group |= mask;
+    grewAt = now;
+  }
+  for (uint8_t i = 0; i < PAD_COUNT; ++i) {
+    if ((group & (1 << i)) && padStates[i].phase != PAD_HELD) padStates[i].phase = PAD_IGNORE;
+  }
+  if (group != sent && (now - grewAt >= COMBO_SETTLE_MS || mask == 0)) {
+    sendPadGesture("combo", group, 0);
+    sent = group;
+  }
+  if (mask == 0) active = false;
+}
+
+static void updatePadGestures(uint32_t now) {
+  const uint32_t holdMs = static_cast<uint32_t>(params[HOLD_MS].value);
+  const uint32_t doubleMs = static_cast<uint32_t>(params[DBL_MS].value);
+  for (uint8_t i = 0; i < PAD_COUNT; ++i) {
+    PadState& state = padStates[i];
+    const bool down = pads[i].pressed;
+    const bool closed = down && !state.was, opened = !down && state.was;
+    state.was = down;
+    switch (state.phase) {
+      case PAD_IDLE:
+        if (closed) {
+          state.phase = PAD_DOWN;
+          state.since = now;
+        }
+        break;
+      case PAD_DOWN:
+        if (opened) {
+          state.phase = PAD_WAIT;
+          state.pressMs = now - state.since;
+          state.since = now;
+        } else if (now - state.since >= holdMs) {
+          state.phase = PAD_HELD;
+          sendPadGesture("tenuto", 1 << i, now - state.since);
+        }
+        break;
+      case PAD_WAIT:
+        if (closed) {
+          state.phase = PAD_IGNORE;
+          sendPadGesture("doppio", 1 << i, now - state.since);
+        } else if (now - state.since >= doubleMs) {
+          state.phase = PAD_IDLE;
+          sendPadGesture("tocco", 1 << i, state.pressMs);
+        }
+        break;
+      case PAD_HELD:
+        if (opened) {
+          state.phase = PAD_IDLE;
+          sendPadGesture("rilascio", 1 << i, now - state.since);
+        }
+        break;
+      case PAD_IGNORE:
+        if (!down) state.phase = PAD_IDLE;
+        break;
+    }
+  }
+  updateCombo(padMask(), now);
+}
+
+// Movimento: la velocita' angolare, nel riferimento della mano, viene divisa in
+// tratti. Un tratto inizia quando la mano supera GESTURE_MOVE_DPS e finisce
+// quando rallenta o inverte la direzione. I tratti di un movimento, fino alla
+// pausa successiva, sono il piccolo buffer su cui si decide: il primo tratto
+// veloce dice direzione e tipo, piu' tratti veloci avanti e indietro sono una
+// scossa. Il cursore intanto continua a muoversi: i due percorsi sono separati.
+struct Stroke {
+  float angle[3] = {0, 0, 0};        // Gradi: cursore X (destra), cursore Y (giu'), rotazione (oraria vista dal polso).
+  float peakMove = 0, peakRoll = 0;  // Velocita' massime, gradi/s.
+  uint32_t startMs = 0, endMs = 0;
+};
+
+struct MotionState {
+  bool moving = false, inStroke = false, haveFirst = false, haveLast = false;
+  bool decided = false, shook = false;
+  Stroke current, first, last, strongest;  // In corso, primo veloce, ultimo veloce, il piu' veloce in assoluto.
+  uint8_t run = 0;                         // Tratti veloci consecutivi in direzioni opposte.
+  float peak = 0;                          // Velocita' massima dell'intero movimento.
+  uint32_t startMs = 0, activeMs = 0;
+};
+
+static MotionState motion;
+
+// Ultimo gesto inviato, per riconoscere la mano che torna alla posizione di partenza.
+static struct {
+  bool valid = false, roll = false;
+  float dir[2] = {0, 0};
+  uint32_t endMs = 0;
+} lastGesture;
+
+static const char* const DIRECTIONS[8] = {"destra", "su_destra", "su", "su_sinistra",
+                                          "sinistra", "giu_sinistra", "giu", "giu_destra"};
+
+static float dot3(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+static float norm3(const float a[3]) { return sqrtf(dot3(a, a)); }
+static float strokePeak(const Stroke& s) { return fmaxf(s.peakMove, s.peakRoll); }
+
+static void classify(const Stroke& s) {
+  const float move = hypotf(s.angle[0], s.angle[1]), roll = s.angle[2];
+  const uint32_t ms = s.endMs - s.startMs;
+  const bool isRoll = fabsf(roll) >= move;
+  const float size = isRoll ? fabsf(roll) : move;
+  const float peak = isRoll ? s.peakRoll : s.peakMove;
+  const char* reason = nullptr;
+  if (isRoll && size < params[FLIP_DEG].value) reason = "rotazione_piccola";
+  else if (isRoll && ms > params[FLIP_MS].value) reason = "rotazione_lenta";
+  else if (!isRoll && size < params[G_ANGLE].value) reason = "piccolo";
+  else if (!isRoll && peak < params[G_PEAK].value) reason = "lento";
+  if (reason) {
+    sendGesture("scartato", reason, ms, size, peak);
+    return;
+  }
+
+  const char* detail;
+  if (isRoll) {
+    detail = roll > 0 ? "oraria" : "antioraria";
+  } else {
+    const float degrees = atan2f(-s.angle[1], s.angle[0]) * 180.0f / PI;  // 0 = destra, 90 = su.
+    detail = DIRECTIONS[(static_cast<int>(lroundf(degrees / 45.0f)) + 8) % 8];
+  }
+  const float dir[2] = {isRoll ? roll : s.angle[0], isRoll ? 0.0f : s.angle[1]};
+  if (lastGesture.valid && lastGesture.roll == isRoll && s.startMs - lastGesture.endMs < RETURN_MS) {
+    const float along = dir[0] * lastGesture.dir[0] + dir[1] * lastGesture.dir[1];
+    if (along < -0.7f * hypotf(dir[0], dir[1]) * hypotf(lastGesture.dir[0], lastGesture.dir[1])) {
+      sendGesture("ritorno", detail, ms, size, peak);
+      lastGesture.valid = false;
+      return;
+    }
+  }
+  sendGesture(isRoll ? "rotazione" : "scatto", detail, ms, size, peak);
+  lastGesture.valid = true;
+  lastGesture.roll = isRoll;
+  lastGesture.dir[0] = dir[0];
+  lastGesture.dir[1] = dir[1];
+  lastGesture.endMs = s.endMs;
+}
+
+static void closeStroke(uint32_t now) {
+  Stroke& s = motion.current;
+  motion.inStroke = false;
+  s.endMs = now;
+  if (strokePeak(s) > strokePeak(motion.strongest)) motion.strongest = s;
+  if (strokePeak(s) < params[G_PEAK].value) return;  // Tratto lento: non e' un gesto.
+  motion.run = motion.haveLast && dot3(motion.last.angle, s.angle) < 0 ? motion.run + 1 : 1;
+  motion.last = s;
+  motion.haveLast = true;
+  if (!motion.haveFirst) {
+    motion.first = s;
+    motion.haveFirst = true;
+  }
+  if (!motion.shook && motion.run >= params[SHAKE_N].value) {
+    motion.shook = motion.decided = true;
+    char count[4];
+    snprintf(count, sizeof(count), "%u", motion.run);
+    sendGesture("scossa", count, now - motion.startMs, 0, motion.peak);
+    lastGesture.valid = false;
+  }
+}
+
+static void updateMotion(const float hand[3], float dt, uint32_t now) {
+  const float speed = norm3(hand);
+  if (speed > GESTURE_MOVE_DPS) {
+    if (!motion.moving) {
+      motion = MotionState();
+      motion.moving = true;
+      motion.startMs = now;
+    }
+    motion.activeMs = now;
+    motion.peak = fmaxf(motion.peak, speed);
+    Stroke& s = motion.current;
+    if (motion.inStroke && norm3(s.angle) > 2.0f && dot3(hand, s.angle) < 0) closeStroke(now);  // Inversione.
+    if (!motion.inStroke) {
+      s = Stroke();
+      s.startMs = now;
+      motion.inStroke = true;
+    }
+    for (int a = 0; a < 3; ++a) s.angle[a] += hand[a] * dt;
+    s.peakMove = fmaxf(s.peakMove, hypotf(hand[0], hand[1]));
+    s.peakRoll = fmaxf(s.peakRoll, fabsf(hand[2]));
+  } else if (motion.inStroke) {
+    closeStroke(now);
+  }
+  if (!motion.moving) return;
+
+  const bool ended = now - motion.activeMs >= QUIET_MS;
+  if (motion.haveFirst && !motion.decided && (ended || now - motion.first.endMs >= DECIDE_MS)) {
+    motion.decided = true;
+    classify(motion.first);
+  }
+  if (!ended) return;
+  motion.moving = false;
+  // Nessun tratto abbastanza veloce, ma poco ci manca: lo si segnala per aiutare a regolare g_peak.
+  if (!motion.haveFirst && motion.peak >= 0.6f * params[G_PEAK].value) {
+    const Stroke& s = motion.strongest;
+    sendGesture("scartato", "lento", s.endMs - s.startMs,
+                fmaxf(hypotf(s.angle[0], s.angle[1]), fabsf(s.angle[2])), motion.peak);
+  }
+}
+
+// Elabora una lettura del sensore: gesti di movimento e pixel da inviare.
 static void processSample(const int16_t raw[6], float dt, bool frozen) {
   if (params[AUTOBIAS].value != 0) trackBias(raw + 3);
 
   float g[3];  // Velocita' angolare in gradi/s, senza offset.
   for (int a = 0; a < 3; ++a) g[a] = raw[3 + a] / LSB_PER_DPS - params[BIAS_X + a].value;
-  const float vx = params[X_GX].value * g[0] + params[X_GY].value * g[1] + params[X_GZ].value * g[2];
-  const float vy = params[Y_GX].value * g[0] + params[Y_GY].value * g[1] + params[Y_GZ].value * g[2];
+  const float xRow[3] = {params[X_GX].value, params[X_GY].value, params[X_GZ].value};
+  const float yRow[3] = {params[Y_GX].value, params[Y_GY].value, params[Y_GZ].value};
+  const float vx = dot3(xRow, g);
+  const float vy = dot3(yRow, g);
   const float speed = sqrtf(vx * vx + vy * vy);
+
+  // Per i gesti serve anche la rotazione della mano su se stessa: e' quella
+  // attorno all'asse perpendicolare ai due del cursore (prodotto vettoriale),
+  // che punta verso le dita. Positiva = oraria vista dal polso.
+  const float axis[3] = {xRow[1] * yRow[2] - xRow[2] * yRow[1],
+                         xRow[2] * yRow[0] - xRow[0] * yRow[2],
+                         xRow[0] * yRow[1] - xRow[1] * yRow[0]};
+  const float axisLength = norm3(axis);
+  const float hand[3] = {vx, vy, axisLength > 0 ? dot3(axis, g) / axisLength : 0.0f};
+  updateMotion(hand, dt, millis());
 
   if (frozen) {
     // Cursore bloccato: si scarta anche il movimento che il filtro stava ancora recuperando.
@@ -460,13 +746,9 @@ static void setupBluetooth() {
 
 void setup() {
   Serial.begin(115200);
-  leftButton.begin();
-  rightButton.begin();
-  clutchButton.begin();
-  // Gli altri contatti restano ingressi e non generano eventi mouse.
-  for (uint8_t pin : UNUSED_PINS) pinMode(pin, INPUT_PULLUP);
+  for (Button& pad : pads) pad.begin();
   delay(1000);
-  Serial.println("\n=== Eous Mouse: GPIO15 sinistro, GPIO16 destro, GPIO17 frizione ===");
+  Serial.println("\n=== Eous Mouse: pad GPIO15 sinistro, 16 destro, 17 frizione, 18 solo gesti ===");
   loadParams();
   setupMpu();
   setupBluetooth();
@@ -474,9 +756,8 @@ void setup() {
 
 void loop() {
   const uint32_t now = millis();
-  leftButton.update(now);
-  rightButton.update(now);
-  clutchButton.update(now);
+  for (Button& pad : pads) pad.update(now);
+  updatePadGestures(now);
   readCommands();
 
   // Cadenza: un passo ogni SAMPLE_MS. Sommare il periodo invece di ripartire da
@@ -527,7 +808,9 @@ void loop() {
   const int8_t dy = takeWhole(remainderY);
 
   // Dati per il PC: tempo (microsecondi), accelerometro, giroscopio medio
-  // dell'intervallo, movimento inviato, stato (1 saturato, 2 frizione, 4 click).
+  // dell'intervallo, movimento inviato, stato: bit 0 saturato, 1 frizione,
+  // 2 blocco al click, 3-6 pad chiusi in questo momento.
+  flags |= padMask() << 3;
   if (streaming && samples > 0) {
     Serial.printf("D,%lu,%d,%d,%d,%ld,%ld,%ld,%d,%d,%u\n", static_cast<unsigned long>(nowUs),
                   accel[0], accel[1], accel[2],

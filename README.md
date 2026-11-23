@@ -19,6 +19,7 @@ usa il proprio supporto per mouse Bluetooth, senza un'applicazione dedicata.
 - [Avvio e associazione Bluetooth](#it-avvio)
 - [Regolazioni](#it-regolazioni)
 - [Calibrazione e regolazione dal PC](#it-calibrazione)
+- [Gesti](#it-gesti)
 - [Struttura del progetto e programmi sperimentali](#it-struttura)
 - [Risoluzione dei problemi](#it-problemi)
 - [Licenza](#it-licenza)
@@ -47,6 +48,8 @@ usa il proprio supporto per mouse Bluetooth, senza un'applicazione dedicata.
   continuano a funzionare.
 - Sensibilità, zona morta, accelerazione del cursore e orientamento del sensore
   si regolano dal computer attraverso la porta seriale, senza ricompilare.
+- In parallelo al movimento del cursore, il firmware riconosce gesti dei pad e
+  della mano e li comunica al computer via seriale. Per ora non eseguono comandi.
 
 La versione attuale non implementa la rotella o il clic centrale. Il livello batteria
 Bluetooth è impostato al 100% come segnaposto: non è una misura reale.
@@ -96,13 +99,13 @@ tuo modulo prima di collegare VCC; SDA e SCL devono usare livelli logici a 3,3 V
 | Sinistro | GPIO15 | GND | Pulsante sinistro premuto |
 | Destro | GPIO16 | GND | Pulsante destro premuto |
 | Frizione (facoltativa) | GPIO17 | GND | Cursore fermo finché il contatto è chiuso |
-| Eventuale contatto aggiuntivo | GPIO18 | Lasciare scollegato per l'uso attuale | Nessuna azione mouse |
+| Pad dei gesti (facoltativo) | GPIO18 | GND | Nessuna azione mouse: solo gesti |
 
-GPIO15, GPIO16 e GPIO17 usano `INPUT_PULLUP`: a riposo il contatto è aperto e il
-livello è HIGH; chiudendolo verso GND diventa LOW. La pull-up è interna, quindi per
-questi contatti non serve una resistenza di pull-up esterna. Senza nulla collegato
-a GPIO17 la frizione non interviene. GPIO18 è configurato come ingresso con pull-up,
-ma non genera eventi mouse.
+I quattro GPIO sono i pad delle dita e GND va al pollice: ogni dito chiude il
+proprio contatto toccando il pollice. Usano `INPUT_PULLUP`: a riposo il contatto è
+aperto e il livello è HIGH; chiudendolo verso GND diventa LOW. La pull-up è interna,
+quindi non serve una resistenza esterna. Senza nulla collegato a GPIO17 la frizione
+non interviene. Tutti e quattro i pad producono anche i gesti descritti più avanti.
 
 ```text
 ESP32-S3                         MPU6050
@@ -115,6 +118,7 @@ GND ---------------------------- AD0
 GPIO15 ---- [contatto sinistro] -- GND
 GPIO16 ---- [contatto destro] ---- GND
 GPIO17 ---- [frizione] ----------- GND
+GPIO18 ---- [pad dei gesti] ------ GND
 
 Computer -- USB ---------------- ESP32-S3 (alimentazione / caricamento / log)
 Computer <------ Bluetooth -----> ESP32-S3 (mouse BLE HID)
@@ -205,6 +209,7 @@ python tools/eous_tune.py
 | `assi` | Impara da due movimenti quale rotazione significa destra e quale su |
 | `drift` | Registra un movimento con ritorno al punto di partenza e indica da dove nasce l'eventuale deriva |
 | `live` / `registra FILE` | Mostra i dati del sensore in tempo reale / li salva in CSV |
+| `gesti` | Mostra i gesti riconosciuti dal firmware e i pad chiusi |
 
 | Parametro | Valore iniziale | Effetto |
 | --- | --- | --- |
@@ -232,6 +237,42 @@ Console e interfaccia grafica non possono usare la porta seriale insieme.
 Il protocollo è testuale, una riga per comando: `get`, `set nome valore`,
 `stream 0|1`, `save`, `reset`. Si può quindi provare anche dal monitor seriale.
 
+<a id="it-gesti"></a>
+### Gesti
+
+Il firmware riconosce i gesti sull'ESP32, in parallelo al movimento del cursore:
+un gesto della mano sposta anche il cursore. Ogni gesto viene inviato sulla seriale
+come riga `G,tipo,dettaglio,durata ms,ampiezza gradi,picco gradi/s`, visibile anche
+nel monitor seriale. L'interfaccia grafica li mostra nel riquadro «Gesti
+riconosciuti dal firmware»; dalla console si usa il comando `gesti`.
+
+| Tipo | Dettaglio | Quando |
+| --- | --- | --- |
+| `tocco` | GPIO del pad | Pad chiuso meno di `hold_ms` e non ripetuto entro `dbl_ms` |
+| `doppio` | GPIO del pad | Secondo tocco entro `dbl_ms` dal primo |
+| `tenuto` / `rilascio` | GPIO del pad | Pad chiuso oltre `hold_ms` / sua riapertura, con la durata totale |
+| `combo` | GPIO dei pad, per esempio `15+16` | Due o più pad chiusi insieme; annulla i gesti dei singoli pad |
+| `scatto` | `destra`, `su_destra`, `su`, … (8 direzioni) | Movimento rapido del polso: almeno `g_angle` gradi a `g_peak` gradi/s |
+| `rotazione` | `oraria` / `antioraria`, vista dal polso | Rotazione della mano su se stessa di almeno `flip_deg` gradi in meno di `flip_ms` |
+| `scossa` | Numero di tratti | Almeno `shake_n` movimenti rapidi alternati avanti e indietro |
+| `ritorno` | Direzione | Gesto opposto al precedente entro 400 ms: la mano che torna, ignorato |
+| `scartato` | Motivo | Movimento quasi riconosciuto: mostra le misure per regolare le soglie |
+
+Il riconoscimento del movimento divide la velocità della mano in tratti, che
+finiscono quando la mano rallenta o inverte la direzione. Il primo tratto veloce
+decide direzione e tipo del gesto; una serie di tratti veloci alternati è una
+scossa. Per la mano destra, girare il palmo dal basso verso l'alto dovrebbe
+risultare una rotazione oraria.
+
+| Parametro | Valore iniziale | Effetto |
+| --- | --- | --- |
+| `hold_ms` | `400` | Millisecondi dopo cui un pad chiuso diventa «tenuto» |
+| `dbl_ms` | `250` | Pausa massima tra i due tocchi di un doppio tocco; è anche il ritardo con cui arriva un tocco semplice |
+| `g_peak` | `150` | Velocità di picco minima, in gradi/s, perché un movimento conti come gesto |
+| `g_angle` | `15` | Ampiezza minima di uno scatto, in gradi |
+| `flip_deg` / `flip_ms` | `90` / `400` | Ampiezza minima e durata massima di una rotazione rapida |
+| `shake_n` | `3` | Tratti alternati minimi di una scossa |
+
 <a id="it-struttura"></a>
 ### Struttura del progetto e programmi sperimentali
 
@@ -239,7 +280,7 @@ Il protocollo è testuale, una riga per comando: `get`, `set nome valore`,
 | --- | --- |
 | [firmware/platformio.ini](firmware/platformio.ini) | Scheda, ambiente di compilazione e dipendenze |
 | [firmware/src/main.cpp](firmware/src/main.cpp) | Firmware attivo: mouse BLE, MPU6050 e due contatti |
-| [tools/eous_tune.py](tools/eous_tune.py) | Calibrazione e regolazione dal PC attraverso la seriale USB |
+| [tools/eous_tune.py](tools/eous_tune.py) | Calibrazione, regolazione e gesti dal PC attraverso la seriale USB |
 | [tools/eous_gui.py](tools/eous_gui.py), [tools/eous_gui.html](tools/eous_gui.html) | Interfaccia grafica nel browser: cursore virtuale e regolazioni |
 | [firmware/src/touch_test_2.cpp](firmware/src/touch_test_2.cpp) | Esperimento: contatti verso GND oppure scansione dei collegamenti tra GPIO15–18; attualmente `MODE 2` |
 | [firmware/test/touch_test_1.cpp](firmware/test/touch_test_1.cpp) | Esperimento: touch capacitivo su GPIO4 e contatto verso GND su GPIO15 |
@@ -290,6 +331,7 @@ mouse support, without a dedicated application.
 - [Startup and Bluetooth pairing](#en-startup)
 - [Adjustments](#en-adjustments)
 - [Calibration and tuning from the PC](#en-calibration)
+- [Gestures](#en-gestures)
 - [Project structure and experimental programs](#en-structure)
 - [Troubleshooting](#en-troubleshooting)
 - [License](#en-license)
@@ -317,6 +359,8 @@ mouse support, without a dedicated application.
   stored offset is used. If the sensor is unavailable, the buttons keep working.
 - Sensitivity, deadzone, pointer acceleration and sensor orientation are tuned
   from the computer over the serial port, without rebuilding.
+- Alongside pointer movement, the firmware recognizes pad and hand gestures and
+  reports them to the computer over serial. They do not run any command yet.
 
 The current version does not implement scrolling or a middle click. The Bluetooth
 battery level is set to 100% as a placeholder; it is not a real measurement.
@@ -365,13 +409,13 @@ before connecting VCC; SDA and SCL must use 3.3 V logic levels.
 | Left | GPIO15 | GND | Left mouse button held down |
 | Right | GPIO16 | GND | Right mouse button held down |
 | Clutch (optional) | GPIO17 | GND | Pointer held still while the contact is closed |
-| Any additional contact | GPIO18 | Leave disconnected for current use | No mouse action |
+| Gesture pad (optional) | GPIO18 | GND | No mouse action: gestures only |
 
-GPIO15, GPIO16 and GPIO17 use `INPUT_PULLUP`: an open contact reads HIGH, and
-closing it to GND reads LOW. The pull-up is internal, so these contacts do not need
-external pull-up resistors. With nothing connected to GPIO17 the clutch never
-engages. GPIO18 is configured as an input with a pull-up but does not generate
-mouse events.
+The four GPIO pins are the finger pads and GND goes to the thumb: each finger
+closes its own contact by touching the thumb. They use `INPUT_PULLUP`: an open
+contact reads HIGH, and closing it to GND reads LOW. The pull-up is internal, so no
+external resistor is needed. With nothing connected to GPIO17 the clutch never
+engages. All four pads also produce the gestures described below.
 
 ```text
 ESP32-S3                         MPU6050
@@ -384,6 +428,7 @@ GND ---------------------------- AD0
 GPIO15 ---- [left contact] ------ GND
 GPIO16 ---- [right contact] ----- GND
 GPIO17 ---- [clutch] ------------ GND
+GPIO18 ---- [gesture pad] ------- GND
 
 Computer -- USB ---------------- ESP32-S3 (power / upload / logs)
 Computer <------ Bluetooth -----> ESP32-S3 (BLE HID mouse)
@@ -475,6 +520,7 @@ python tools/eous_tune.py
 | `assi` | Learns from two movements which rotation means right and which means up |
 | `drift` | Records a movement that returns to its starting point and reports where any drift comes from |
 | `live` / `registra FILE` | Shows the sensor data in real time / saves it as CSV |
+| `gesti` | Shows the gestures recognized by the firmware and the closed pads |
 
 | Parameter | Initial value | Effect |
 | --- | --- | --- |
@@ -502,6 +548,42 @@ console and the graphical interface cannot use the serial port at the same time.
 The protocol is plain text, one command per line: `get`, `set name value`,
 `stream 0|1`, `save`, `reset`. It can therefore be tried from the serial monitor too.
 
+<a id="en-gestures"></a>
+### Gestures
+
+The firmware recognizes gestures on the ESP32, alongside pointer movement: a hand
+gesture also moves the pointer. Each gesture is sent over serial as a line
+`G,type,detail,duration ms,amplitude degrees,peak degrees/s`, also visible in the
+serial monitor. The graphical interface shows them in the «Gesti riconosciuti dal
+firmware» panel; in the console, use the `gesti` command. Gesture names are in
+Italian.
+
+| Type | Detail | When |
+| --- | --- | --- |
+| `tocco` (tap) | Pad GPIO | Pad closed for less than `hold_ms` and not repeated within `dbl_ms` |
+| `doppio` (double tap) | Pad GPIO | Second tap within `dbl_ms` of the first |
+| `tenuto` / `rilascio` (hold / release) | Pad GPIO | Pad closed longer than `hold_ms` / its release, with the total duration |
+| `combo` | Pad GPIOs, for example `15+16` | Two or more pads closed together; cancels the single-pad gestures |
+| `scatto` (flick) | `destra`, `su_destra`, `su`, … (8 directions) | Quick wrist movement: at least `g_angle` degrees at `g_peak` degrees/s |
+| `rotazione` (rotation) | `oraria` / `antioraria` (clockwise / counterclockwise, seen from the wrist) | Hand rolling on itself by at least `flip_deg` degrees in under `flip_ms` |
+| `scossa` (shake) | Number of strokes | At least `shake_n` quick alternating back-and-forth movements |
+| `ritorno` (return) | Direction | Gesture opposite to the previous one within 400 ms: the hand returning, ignored |
+| `scartato` (discarded) | Reason | Almost-recognized movement: shows the measures to help tune thresholds |
+
+Movement recognition splits the hand's speed into strokes, which end when the hand
+slows down or reverses. The first fast stroke decides the gesture's direction and
+type; a series of fast alternating strokes is a shake. For the right hand, turning
+the palm from down to up should register as a clockwise rotation.
+
+| Parameter | Initial value | Effect |
+| --- | --- | --- |
+| `hold_ms` | `400` | Milliseconds after which a closed pad becomes a hold |
+| `dbl_ms` | `250` | Maximum pause between the two taps of a double tap; also the delay before a single tap is reported |
+| `g_peak` | `150` | Minimum peak speed, in degrees/s, for a movement to count as a gesture |
+| `g_angle` | `15` | Minimum flick amplitude, in degrees |
+| `flip_deg` / `flip_ms` | `90` / `400` | Minimum amplitude and maximum duration of a quick rotation |
+| `shake_n` | `3` | Minimum alternating strokes of a shake |
+
 <a id="en-structure"></a>
 ### Project structure and experimental programs
 
@@ -509,7 +591,7 @@ The protocol is plain text, one command per line: `get`, `set name value`,
 | --- | --- |
 | [firmware/platformio.ini](firmware/platformio.ini) | Board, build environment and dependencies |
 | [firmware/src/main.cpp](firmware/src/main.cpp) | Active firmware: BLE mouse, MPU6050 and two contacts |
-| [tools/eous_tune.py](tools/eous_tune.py) | Calibration and tuning from the PC over USB serial |
+| [tools/eous_tune.py](tools/eous_tune.py) | Calibration, tuning and gestures from the PC over USB serial |
 | [tools/eous_gui.py](tools/eous_gui.py), [tools/eous_gui.html](tools/eous_gui.html) | Graphical interface in the browser: virtual pointer and adjustments |
 | [firmware/src/touch_test_2.cpp](firmware/src/touch_test_2.cpp) | Experiment: contacts to GND or connection scanning between GPIO15–18; currently `MODE 2` |
 | [firmware/test/touch_test_1.cpp](firmware/test/touch_test_1.cpp) | Experiment: capacitive touch on GPIO4 and a contact to GND on GPIO15 |

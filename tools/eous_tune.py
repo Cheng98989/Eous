@@ -36,12 +36,42 @@ DESCRIPTIONS = {
     "clutch": "frizione su GPIO17: 0 = no, 1 = premuta per muovere, 2 = premuta per bloccare",
     "click_ms": "ms di cursore fermo dopo ogni pressione o rilascio di un pulsante",
     "autobias": "1 = l'offset si corregge da solo quando il sensore è fermo",
+    "hold_ms": "pad: chiuso più a lungo di così diventa «tenuto», ms",
+    "dbl_ms": "pad: pausa massima tra i due tocchi di un doppio tocco, ms",
+    "g_peak": "gesti: velocità di picco minima di un tratto, °/s",
+    "g_angle": "scatto: ampiezza minima, gradi",
+    "flip_deg": "rotazione rapida: ampiezza minima, gradi",
+    "flip_ms": "rotazione rapida: durata massima, ms",
+    "shake_n": "scossa: tratti veloci minimi in direzioni alternate",
 }
 
 # Un campione per ogni report del mouse. t: secondi dal primo campione; acc: g;
 # gyro: °/s medi dall'ultimo report (offset incluso); dx, dy: pixel inviati; flags: stato.
 Sample = collections.namedtuple("Sample", "t acc gyro dx dy flags")
 SATURATED, CLUTCHED, CLICKING = 1, 2, 4  # bit di Sample.flags
+PAD_SHIFT = 3  # i bit da 3 a 6 di Sample.flags sono i pad chiusi
+PAD_PINS = (15, 16, 17, 18)
+
+# Evento riconosciuto dal firmware (riga "G,..."): tipo, dettaglio, durata in ms,
+# ampiezza in gradi e velocità di picco in °/s.
+Gesture = collections.namedtuple("Gesture", "kind detail ms angle peak")
+PAD_GESTURES = ("tocco", "doppio", "tenuto", "rilascio", "combo")
+
+
+def describe(gesture):
+    """Descrizione leggibile di un evento del firmware."""
+    detail = gesture.detail.replace("_", "-")
+    if gesture.kind in PAD_GESTURES:
+        text = f"{gesture.kind} pad {detail}"
+        return text + (f" ({gesture.ms} ms)" if gesture.kind in ("tenuto", "rilascio") else "")
+    if gesture.kind == "scossa":
+        return f"scossa: {detail} tratti in {gesture.ms} ms, picco {gesture.peak:.0f} °/s"
+    measures = f"{gesture.angle:.0f}° in {gesture.ms} ms, picco {gesture.peak:.0f} °/s"
+    if gesture.kind == "ritorno":
+        return f"ritorno {detail}, ignorato: {measures}"
+    if gesture.kind == "scartato":
+        return f"scartato ({detail}): {measures}"
+    return f"{gesture.kind} {detail}: {measures}"
 
 
 class DeviceError(Exception):
@@ -176,6 +206,7 @@ class Device:
         self.buffer = b""
         self.backlog = []  # righe di dati arrivate mentre si aspettava la risposta a un comando
         self.bias_updates = 0  # quante volte il firmware ha comunicato un nuovo offset
+        self.gestures = collections.deque(maxlen=200)  # eventi ricevuti e non ancora letti
         self.info = {}
         self.params = {}
         self._connect()
@@ -203,6 +234,8 @@ class Device:
                 reply.append(line)
             elif line[:2] in ("D,", "B,"):
                 self.backlog.append(line)
+            elif line.startswith("G,"):
+                self._gesture(line)
         raise DeviceError(f"nessuna risposta al comando '{text}'")
 
     def refresh(self):
@@ -256,6 +289,12 @@ class Device:
         finally:
             self.command("stream 0")
 
+    def _gesture(self, line):
+        parts = line.split(",")
+        with contextlib.suppress(ValueError):
+            if len(parts) == 6:
+                self.gestures.append(Gesture(parts[1], parts[2], int(parts[3]), float(parts[4]), float(parts[5])))
+
     def _samples(self):
         lsb_dps, lsb_g = self.info["lsb_per_dps"], self.info["lsb_per_g"]
         t = 0.0
@@ -265,6 +304,9 @@ class Device:
             if line is None:
                 raise DeviceError("il sensore non manda dati: controlla i messaggi [MPU] all'avvio")
             parts = line.split(",")
+            if parts[0] == "G":
+                self._gesture(line)
+                continue
             if parts[0] == "B" and len(parts) == 4:
                 # Il firmware ha corretto da solo l'offset del giroscopio.
                 with contextlib.suppress(ValueError):
@@ -389,6 +431,29 @@ class Shell(cmd.Cmd):
                     print(f"\r  giroscopio {fmt(sub(sample.gyro, bias), 1):>26} °/s"
                           f" | accelerometro {fmt(sample.acc)} g"
                           f" | cursore {sample.dx:+4d} {sample.dy:+4d} ", end="", flush=True)
+
+    def do_gesti(self, arg):
+        """gesti [SECONDI]: mostra i gesti riconosciuti dal firmware e i pad chiusi.
+        Senza durata continua fino a Ctrl+C."""
+        try:
+            seconds = float(arg) if arg.strip() else math.inf
+        except ValueError:
+            print("Uso: gesti [SECONDI]")
+            return
+        print("Tocca i pad con il pollice o muovi la mano. Ctrl+C per fermare.")
+        self.dev.gestures.clear()
+        last_pads = 0
+        with self.dev.stream() as samples:
+            for sample in samples:
+                while self.dev.gestures:
+                    print(f"  {sample.t:7.2f} s  {describe(self.dev.gestures.popleft())}")
+                pads = sample.flags >> PAD_SHIFT
+                if pads != last_pads:
+                    closed = [str(pin) for i, pin in enumerate(PAD_PINS) if pads & (1 << i)]
+                    print(f"  {sample.t:7.2f} s  pad chiusi: {'+'.join(closed) or 'nessuno'}")
+                    last_pads = pads
+                if sample.t >= seconds:
+                    return
 
     def do_registra(self, arg):
         """registra FILE [SECONDI]: salva i dati grezzi in un file CSV (10 secondi se non indicato)."""

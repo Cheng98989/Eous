@@ -43,6 +43,30 @@
   #badges { float: right; }
   #badges span { margin-left: 8px; padding: 2px 8px; border-radius: 10px; background: var(--ideal); color: #14161a; font-size: 12px; font-weight: 600; visibility: hidden; }
   #badges span.on { visibility: visible; }
+  #gestures { margin-top: 16px; }
+  .pads { display: flex; gap: 8px; margin-bottom: 12px; }
+  .pads div { flex: 1; text-align: center; padding: 8px 4px; border: 1px solid var(--line); border-radius: 6px;
+              color: var(--muted); font-size: 12px; transition: background .08s; }
+  .pads div b { display: block; color: var(--text); font: 600 14px ui-monospace, monospace; }
+  .pads div.on { background: var(--accent); border-color: var(--accent); color: #0d0f12; }
+  .pads div.on b { color: #0d0f12; }
+  #lastGesture { display: flex; align-items: center; gap: 14px; min-height: 64px; padding: 8px 12px;
+                 border: 1px solid var(--line); border-radius: 6px; background: #0d0f12; }
+  #lastGesture .symbol { font-size: 36px; width: 48px; text-align: center; }
+  #lastGesture .name { font-size: 18px; font-weight: 600; }
+  #lastGesture .measures { color: var(--muted); font-size: 12px; }
+  #lastGesture.flash { animation: flash .6s ease-out; }
+  @keyframes flash { from { background: #23415f; } to { background: #0d0f12; } }
+  .gesture-columns { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; margin-top: 12px; }
+  #log { list-style: none; margin: 0; padding: 0; font: 12px ui-monospace, monospace; max-height: 260px; overflow-y: auto; }
+  #log li { padding: 3px 0; border-bottom: 1px solid var(--line); }
+  #log li.ignored { color: var(--muted); }
+  #log time { color: var(--muted); margin-right: 8px; }
+  #counts { width: 100%; border-collapse: collapse; font-size: 12px; }
+  #counts td { padding: 3px 0; border-bottom: 1px solid var(--line); }
+  #counts td:last-child { text-align: right; font: 600 12px ui-monospace, monospace; }
+  .row-tools { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; color: var(--muted); font-size: 12px; }
+  .row-tools button { width: auto; margin: 0; padding: 4px 12px; }
 </style>
 </head>
 <body>
@@ -66,6 +90,24 @@
     <p class="hint">Il riquadro rappresenta il tuo schermo. Il cursore disegnato segue i movimenti che il firmware
       invia via Bluetooth, prima che il sistema operativo applichi la propria accelerazione: se qui torna al centro
       e il cursore vero no, la differenza nasce nel computer e non nel dispositivo.</p>
+
+    <section id="gestures">
+      <h2>Gesti riconosciuti dal firmware</h2>
+      <div class="pads" id="pads"></div>
+      <div id="lastGesture"><span class="symbol">·</span><div><div class="name">Nessun gesto</div>
+        <div class="measures">Tocca i pad con il pollice o fai un movimento deciso con la mano.</div></div></div>
+      <div class="gesture-columns">
+        <ul id="log"></ul>
+        <table id="counts"></table>
+      </div>
+      <div class="row-tools">
+        <label><input type="checkbox" id="showIgnored"> mostra anche scartati e ritorni</label>
+        <button id="clearGestures">Azzera</button>
+      </div>
+      <p class="hint">Il riconoscimento avviene sull'ESP32, in parallelo al movimento del cursore: un gesto sposta
+        anche il cursore. Per ora i gesti non eseguono nessun comando. I movimenti scartati mostrano le misure
+        che non hanno superato le soglie, utili per regolarle.</p>
+    </section>
   </div>
 
   <div>
@@ -106,6 +148,15 @@ const CONTROLS = [
   { name: "click_ms", label: "Blocco al click", unit: "ms", min: 0, max: 300, step: 10 },
   { group: "Frizione (contatto GPIO17 - GND)" },
   { name: "clutch", options: ["Non usata", "Premuta per muovere", "Premuta per bloccare"] },
+  { group: "Gesti dei pad" },
+  { name: "hold_ms", label: "Tenuto dopo", unit: "ms", min: 150, max: 1000, step: 10 },
+  { name: "dbl_ms", label: "Pausa massima del doppio tocco", unit: "ms", min: 100, max: 600, step: 10 },
+  { group: "Gesti di movimento" },
+  { name: "g_peak", label: "Velocità minima", unit: "°/s", min: 50, max: 800, step: 10 },
+  { name: "g_angle", label: "Scatto: ampiezza minima", unit: "°", min: 5, max: 60, step: 1 },
+  { name: "flip_deg", label: "Rotazione: ampiezza minima", unit: "°", min: 30, max: 180, step: 5 },
+  { name: "flip_ms", label: "Rotazione: durata massima", unit: "ms", min: 100, max: 1000, step: 10 },
+  { name: "shake_n", label: "Scossa: tratti minimi", unit: "", min: 2, max: 8, step: 1 },
 ];
 const TRAIL_SECONDS = 8;
 const COLORS = { sent: "#4da3ff", ideal: "#f0a13a", grid: "#2f343d", text: "#9299a6" };
@@ -144,6 +195,7 @@ function cursorSpeed(speed) {
 const badgeUntil = {};
 
 function onSample([t, gx, gy, gz, dx, dy, flags]) {
+  PADS.forEach((pad, i) => pad.element.classList.toggle("on", Boolean(flags & (1 << (3 + i)))));
   for (const bit of [1, 2, 4]) {
     if (flags & bit) badgeUntil[bit] = performance.now() + 300;  // resta visibile anche per un blocco breve
     $("badge" + bit).classList.toggle("on", badgeUntil[bit] > performance.now());
@@ -284,7 +336,7 @@ function post(path, body) {
 const pending = {};  // un invio in attesa per parametro: trascinando si spedisce al più ogni 80 ms
 
 function format(control, value) {
-  return `${+value.toFixed(2)} ${control.unit}`;
+  return `${+value.toFixed(2)} ${control.unit}`.trim();
 }
 
 function send(name, value) {
@@ -354,7 +406,86 @@ document.addEventListener("keydown", event => {
   if (event.key.toLowerCase() === "c" && !event.ctrlKey && !event.metaKey) center();
 });
 
+// --- gesti ---
+
+const PADS = [
+  { pin: 15, role: "sinistro" }, { pin: 16, role: "destro" },
+  { pin: 17, role: "frizione" }, { pin: 18, role: "solo gesti" },
+];
+for (const pad of PADS) {
+  pad.element = document.createElement("div");
+  pad.element.innerHTML = `<b>GPIO${pad.pin}</b>${pad.role}`;
+  $("pads").append(pad.element);
+}
+
+const ARROWS = {
+  destra: "→", su_destra: "↗", su: "↑", su_sinistra: "↖",
+  sinistra: "←", giu_sinistra: "↙", giu: "↓", giu_destra: "↘", oraria: "↻", antioraria: "↺",
+};
+const PAD_SYMBOLS = { tocco: "●", doppio: "●●", tenuto: "▬", rilascio: "○", combo: "⊕" };
+const IGNORED = ["scartato", "ritorno"];
+const counts = new Map();
+
+function describe(g) {
+  const detail = g.detail.replaceAll("_", "-");
+  const measures = `${Math.round(g.angle)}° in ${g.ms} ms · picco ${Math.round(g.peak)} °/s`;
+  if (g.kind in PAD_SYMBOLS) {
+    const timing = g.kind === "tenuto" || g.kind === "rilascio" ? `${g.ms} ms` : "";
+    return { symbol: PAD_SYMBOLS[g.kind], name: `${g.kind} · pad ${detail}`, measures: timing };
+  }
+  if (g.kind === "scossa") {
+    return { symbol: "≋", name: "scossa", measures: `${g.detail} tratti in ${g.ms} ms · picco ${Math.round(g.peak)} °/s` };
+  }
+  if (g.kind === "scartato") return { symbol: "×", name: `scartato: ${detail}`, measures };
+  if (g.kind === "ritorno") return { symbol: "↩", name: `ritorno ${detail} (ignorato)`, measures };
+  const name = g.kind === "rotazione" ? `rotazione ${detail}` : detail;
+  return { symbol: ARROWS[g.detail] || "?", name, measures };
+}
+
+function onGesture(g) {
+  const ignored = IGNORED.includes(g.kind);
+  if (ignored && !$("showIgnored").checked) return;
+  const text = describe(g);
+  counts.set(text.name, (counts.get(text.name) || 0) + 1);
+  showCounts();
+
+  if (!ignored) {
+    const last = $("lastGesture");
+    last.querySelector(".symbol").textContent = text.symbol;
+    last.querySelector(".name").textContent = text.name;
+    last.querySelector(".measures").textContent = text.measures;
+    last.classList.remove("flash");
+    void last.offsetWidth;  // fa ripartire l'animazione anche per due gesti uguali di fila
+    last.classList.add("flash");
+  }
+  const item = document.createElement("li");
+  item.className = ignored ? "ignored" : "";
+  const time = document.createElement("time");
+  time.textContent = new Date().toLocaleTimeString("it-IT");
+  item.append(time, `${text.symbol} ${text.name}${text.measures ? " · " + text.measures : ""}`);
+  $("log").prepend(item);
+  while ($("log").children.length > 50) $("log").lastChild.remove();
+}
+
+function showCounts() {
+  const rows = [...counts].sort((a, b) => b[1] - a[1]);
+  $("counts").replaceChildren(...rows.map(([name, count]) => {
+    const row = document.createElement("tr");
+    row.innerHTML = "<td></td><td></td>";
+    row.cells[0].textContent = name;
+    row.cells[1].textContent = count;
+    return row;
+  }));
+}
+
+$("clearGestures").addEventListener("click", () => {
+  counts.clear();
+  showCounts();
+  $("log").replaceChildren();
+});
+
 const events = new EventSource("/events");
+events.addEventListener("gesture", event => onGesture(JSON.parse(event.data)));
 events.addEventListener("params", event => showParams(JSON.parse(event.data)));
 events.addEventListener("sample", event => onSample(JSON.parse(event.data)));
 events.addEventListener("status", event => showStatus(JSON.parse(event.data)));

@@ -74,6 +74,8 @@ def serial_worker(device, hub, commands, stop):
         for sample in samples:
             hub.publish("sample", [round(sample.t, 4), *(round(g, 2) for g in sample.gyro),
                                    sample.dx, sample.dy, sample.flags])
+            while device.gestures:
+                hub.publish("gesture", device.gestures.popleft()._asdict())
             if device.bias_updates != bias_updates:  # il firmware ha corretto l'offset da solo
                 bias_updates = device.bias_updates
                 hub.publish("params", {**device.info, **device.params}, remember=True)
